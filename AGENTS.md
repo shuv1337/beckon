@@ -41,9 +41,19 @@ Independent project built for Omarchy users — not affiliated with Omarchy, Hyp
 
 ## How the pieces fit
 
+- **`common.py`** is the one leaf module: paths, `settings()`/`setting()`,
+  `api_key()`, `write_private()` (0600 + atomic), `generate_content()` (key in
+  the `x-goog-api-key` header, never the URL), `ydo()`, `browser()`, `notify()`.
+  Every model name lives in `common.DEFAULTS` and can be overridden from
+  `settings.json`. Don't re-copy any of these into another file.
 - **Tool schema** is generated from `tools.py` function signatures and
   docstrings. To add a tool: write a function, list it in `TOOLS` at the
   bottom of the file. Docstrings are what the model reads — keep them exact.
+  Parameter types come from the default value: `False` → BOOLEAN, `0` →
+  INTEGER, `""` → STRING. `live.coerce_args` also casts what the model sends,
+  so a string `"false"` for `force=` can never read as True. Tool calls run
+  in a worker thread (`live.run_tools`), sequentially, so a slow screen read
+  never freezes the mic or speaker.
 - **Shell tools** live in `~/.config/beckon/custom_tools.json` and are loaded
   by `load_custom_tools()` at import. `{arg}` placeholders are shell-quoted.
 - **Hyprland calls** use the Lua dispatcher API via `hyprctl dispatch 'hl.dsp…'`.
@@ -112,8 +122,27 @@ Independent project built for Omarchy users — not affiliated with Omarchy, Hyp
   `python-gobject`. GTK apps expose text without the Chrome flag.
 - **Machine-specific tour values** are read from `~/.config/beckon/settings.json`
   (never committed): `dev_url` is the local dev server the tour opens at the end,
-  `dev_line` the narration spoken over it. Both fall back to generic defaults, so
-  nothing about one user's machine belongs in `tour.py`.
+  `dev_line` the narration spoken over it. Both are settable from the panel and
+  fall back to generic defaults, so nothing about one user's machine belongs in
+  `tour.py`.
+- **Settings apply everywhere.** `live.py` reads `settings.json` for the model
+  and voice when the `BECKON_LIVE_*` env vars are unset, so a choice made in the
+  panel also applies when the keybind starts the session.
+- **The tour restores the theme.** `tour._run` captures `omarchy theme current`
+  before it starts and puts it back in `finally`, even if a step raised. It
+  types into Claude only if Claude actually took focus, and never presses
+  Return. If narration can't be generated it notifies once and runs silent.
+- **Panel POSTs are same-origin only.** `ui.Handler._same_origin` requires
+  `Content-Type: application/json`, a `Host` of `127.0.0.1:<port>` or
+  `localhost:<port>`, and an `Origin` that is either absent or one of those. A
+  page on any other site can otherwise fire a no-preflight `text/plain` POST at
+  `/api/custom-tools` and register a shell command. Don't loosen this.
+- **Tests** live in `tests/`; run `pytest` from the repo root. They cover the
+  schema builder, argument coercion, the dangerous-bind matcher, private file
+  writes, memory caps, settings parsing and custom-tool quoting. Nothing in
+  them touches Hyprland, audio or the network.
+- **Pre-commit hook.** `install.sh` sets `core.hooksPath .githooks` on the
+  clone it runs from; on any other clone run that `git config` by hand.
 
 ## Pitfalls already hit — don't re-learn these
 

@@ -11,9 +11,10 @@ notes only), so the model starts every session already knowing your habits.
 
 import json
 import time
-from pathlib import Path
 
-FILE = Path.home() / ".config" / "beckon" / "memory.json"
+import common
+
+FILE = common.CONFIG / "memory.json"
 MAX_PREFS, MAX_NOTES, MAX_LEN, PROMPT_NOTES = 40, 30, 200, 15
 
 
@@ -27,9 +28,7 @@ def _load():
 
 def _save(d):
     """Write atomically and 0600 -- this file is a record of the user's habits."""
-    FILE.parent.mkdir(parents=True, exist_ok=True)
-    FILE.write_text(json.dumps(d, indent=2))
-    FILE.chmod(0o600)
+    common.write_private(FILE, json.dumps(d, indent=2))
 
 
 def _clip(s):

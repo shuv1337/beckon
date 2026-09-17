@@ -11,20 +11,18 @@ import os
 import subprocess
 import sys
 import threading
-import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
+import common    # noqa: E402
 import tools     # noqa: E402
 import memory    # noqa: E402
 
-CONFIG = Path.home() / ".config" / "beckon"
-DATA = Path.home() / ".local" / "share" / "beckon"
-KEYFILE = CONFIG / "api_key"
-SETTINGS = CONFIG / "settings.json"
-HISTORY = DATA / "history.jsonl"
+CONFIG = common.CONFIG
+KEYFILE = common.KEYFILE
+HISTORY = common.DATA / "history.jsonl"
 CUSTOM = CONFIG / "custom_tools.json"
 
 
@@ -42,36 +40,21 @@ def read_custom():
 
 def write_custom(items):
     import importlib
-    CONFIG.mkdir(parents=True, exist_ok=True)
-    CUSTOM.write_text(json.dumps(items, indent=2))
-    CUSTOM.chmod(0o600)          # these are shell commands the user wrote
+    common.write_private(CUSTOM, json.dumps(items, indent=2))   # shell commands the user wrote
     importlib.reload(tools)   # so the panel's tool list reflects it immediately
 
 PORT = int(os.environ.get("BECKON_UI_PORT", "8777"))
 
-DEFAULTS = {
-    "model": "gemini-3.1-flash-live-preview",
-    "voice": "Puck",
-    "text_model": "gemini-3.8-flash",
-}
-
-
-def load_settings():
-    s = dict(DEFAULTS)
-    if SETTINGS.exists():
-        try:
-            s.update(json.loads(SETTINGS.read_text()))
-        except json.JSONDecodeError:
-            pass
-    return s
+DEFAULTS = common.DEFAULTS
+load_settings = common.settings
 
 
 def save_settings(new):
+    """Merge known keys into settings.json. Every key in common.DEFAULTS is
+    settable here -- including dev_url/dev_line, which the README documents."""
     s = load_settings()
-    s.update({k: v for k, v in new.items() if k in DEFAULTS})
-    CONFIG.mkdir(parents=True, exist_ok=True)
-    SETTINGS.write_text(json.dumps(s, indent=2))
-    SETTINGS.chmod(0o600)
+    s.update({k: str(v).strip() for k, v in new.items() if k in DEFAULTS and isinstance(v, (str, int, float))})
+    common.write_private(common.SETTINGS_FILE, json.dumps(s, indent=2))
     return s
 
 
@@ -93,13 +76,13 @@ def list_voices():
 
 
 def live_running():
-    pid = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "beckon" / "live.pid"
-    if not pid.exists():
-        return False
+    """True if the PID file names a live Beckon session -- not just any process
+    that inherited a stale PID."""
+    pidfile = common.STATE / "live.pid"
     try:
-        os.kill(int(pid.read_text().strip()), 0)
-        return True
-    except (ValueError, ProcessLookupError, PermissionError):
+        pid = int(pidfile.read_text().strip())
+        return b"live.py" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (OSError, ValueError):
         return False
 
 
@@ -152,7 +135,7 @@ class Handler(BaseHTTPRequestHandler):
                 "key": key_status(),
                 "settings": s,
                 "voices": list_voices(),
-                "active_voice": load_settings().get("voice", "Puck"),
+                "active_voice": s["voice"],
                 "live_running": live_running(),
                 "tools": [
                     {"name": n, "doc": (f.__doc__ or "").strip()}
@@ -166,20 +149,41 @@ class Handler(BaseHTTPRequestHandler):
             })
         return self._send({"error": "not found"}, 404)
 
+    def _same_origin(self):
+        """Only the panel's own page may POST. Any site the user has open can
+        fire a text/plain POST at 127.0.0.1:8777 without a preflight, and one
+        of these endpoints registers a shell command the assistant can run --
+        so require a JSON content type, a Host that is really us (DNS
+        rebinding), and an Origin that is us or absent (same-origin fetches
+        from this page send our own origin; cross-site ones send theirs)."""
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            return False
+        host = (self.headers.get("Host") or "").strip().lower()
+        allowed = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+        if host not in allowed:
+            return False
+        origin = (self.headers.get("Origin") or "").strip().lower()
+        if origin and origin not in {f"http://{h}" for h in allowed}:
+            return False
+        return True
+
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
+        if not self._same_origin():
+            return self._send({"error": "cross-origin request refused"}, 403)
         try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(min(length, 1 << 20)) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return self._send({"error": "bad json"}, 400)
+        if not isinstance(body, dict):
             return self._send({"error": "bad json"}, 400)
 
         if self.path == "/api/key":
             key = (body.get("key") or "").strip()
             if len(key) < 20:
                 return self._send({"error": "that doesn't look like a key (too short)"}, 400)
-            CONFIG.mkdir(parents=True, exist_ok=True)
-            KEYFILE.write_text(key)
-            KEYFILE.chmod(0o600)
+            common.write_private(KEYFILE, key)   # 0600 from the first byte, atomic
             return self._send({"ok": True, "key": key_status()})
 
         if self.path == "/api/settings":
@@ -218,30 +222,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"ok": True, "memory": memory_view()})
 
         if self.path == "/api/clear-history":
-            HISTORY.write_text("")
-            HISTORY.chmod(0o600)
+            common.write_private(HISTORY, "")
             return self._send({"ok": True})
 
         if self.path == "/api/live":
             action = body.get("action")
-            env = dict(os.environ)
+            # live.py reads settings.json itself now; env is kept so a panel
+            # start still wins over a stale env in the panel's own process.
             st = load_settings()
-            env["BECKON_LIVE_VOICE"] = st.get("voice", "Puck")
-            env["BECKON_LIVE_MODEL"] = st.get("model", DEFAULTS["model"])
-            if action == "start" and not live_running():
-                subprocess.Popen([sys.executable, str(HERE / "live.py")],
-                                 env=env, start_new_session=True,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            elif action == "stop" and live_running():
+            env = dict(os.environ, BECKON_LIVE_VOICE=st["voice"], BECKON_LIVE_MODEL=st["model"])
+            # live.py toggles: with a session running it stops it, otherwise it starts one
+            if (action == "start") != live_running():
                 subprocess.Popen([sys.executable, str(HERE / "live.py")],
                                  env=env, start_new_session=True,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             import time as _t
             _t.sleep(1.2)
             return self._send({"ok": True, "running": live_running()})
-
-
-
 
         return self._send({"error": "not found"}, 404)
 
@@ -252,7 +249,7 @@ def main():
     print(f"Beckon control panel -> {url}   (Ctrl+C to stop)")
     if "--no-open" not in sys.argv:
         threading.Timer(0.6, lambda: subprocess.run(
-            ["uwsm-app", "--", "google-chrome-stable", f"--app={url}"],
+            ["uwsm-app", "--", common.browser(), f"--app={url}"],
             check=False)).start()
     try:
         srv.serve_forever()

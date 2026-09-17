@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # never commit credentials or local state
 api_key

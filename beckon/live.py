@@ -21,6 +21,7 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
+import common  # noqa: E402
 import tools   # noqa: E402
 import memory  # noqa: E402
 
@@ -28,21 +29,21 @@ import sounddevice as sd  # noqa: E402
 from google import genai  # noqa: E402
 from google.genai import types  # noqa: E402
 
-CONFIG = Path.home() / ".config" / "beckon"
-DATA = Path.home() / ".local" / "share" / "beckon"
-HISTORY = DATA / "history.jsonl"
-STATE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "beckon"
+HISTORY = common.DATA / "history.jsonl"
+STATE = common.STATE
 STATE.mkdir(parents=True, exist_ok=True)
 PIDFILE = STATE / "live.pid"
 MUTE = STATE / "mute"   # present while the tour narrates
 
-MODEL = os.environ.get("BECKON_LIVE_MODEL", "gemini-3.1-flash-live-preview")
+# Environment wins (the panel's start button sets it), then settings.json, so
+# the choices made in the panel also apply when the keybind starts a session.
+MODEL = os.environ.get("BECKON_LIVE_MODEL") or common.setting("model")
+VOICE = os.environ.get("BECKON_LIVE_VOICE") or common.setting("voice")
 # By default the mic is gated while the model speaks, so its own voice coming
 # back through the speakers can't be mistaken for you interrupting it. Set
 # BECKON_BARGE_IN=1 (headphones) to keep the mic open and allow talking over it.
 BARGE_IN = os.environ.get("BECKON_BARGE_IN") == "1"
 SPEAK_TAIL = 0.4   # seconds to keep the mic closed after playback drains
-VOICE = os.environ.get("BECKON_LIVE_VOICE", "Puck")
 
 IN_RATE, OUT_RATE, CHUNK = 16000, 24000, 1024
 
@@ -93,29 +94,32 @@ Never ask the user to scroll so you can see more -- read the text instead.
 - The laptop screen is eDP-1; other monitors are external.
 
 GUIDED TOUR
-If the user asks for a tour or a demo, call guided_tour() ONCE and then say
-nothing at all -- not a word -- until they speak to you again. The tour
-narrates itself with its own voice on a fixed timeline; anything you say will
-talk over it. Do not call other tools while it runs.
-
-The tour ends by typing a post on X. It never presses send; the user does.
+Call guided_tour() ONLY if they clearly asked for a tour, a demo, or to
+"show me around". "What can you do" / "help" / "what are you" is a short
+spoken answer listing capabilities -- do NOT start the tour. If you do
+call it, call it ONCE, post_to_x=false unless they asked to post, then
+say nothing until they speak again. The tour narrates itself.
 """
 
 PY_TO_JSON = {int: "INTEGER", float: "NUMBER", bool: "BOOLEAN", str: "STRING"}
+FALSY = {"false", "0", "no", "off", ""}
+
+notify = common.notify
+api_key = common.api_key
 
 
-def notify(msg, urgency="normal"):
-    import subprocess
-    subprocess.run(["notify-send", "-a", "Beckon", "-u", urgency, "Beckon", str(msg)[:250]],
-                   check=False)
-
-
-def api_key():
-    k = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if k:
-        return k.strip()
-    f = CONFIG / "api_key"
-    return f.read_text().strip() if f.exists() else None
+def param_type(p):
+    """The Python type a parameter's default implies. bool is checked before
+    int because bool is a subclass of int -- getting this wrong once declared
+    every flag as a STRING, and bool("false") is True."""
+    d = p.default
+    if isinstance(d, bool):
+        return bool
+    if isinstance(d, int):
+        return int
+    if isinstance(d, float):
+        return float
+    return str
 
 
 def declarations():
@@ -124,8 +128,7 @@ def declarations():
     for name, fn in tools.TOOLS.items():
         props, required = {}, []
         for pname, p in inspect.signature(fn).parameters.items():
-            kind = int if isinstance(p.default, int) and not isinstance(p.default, bool) else str
-            props[pname] = {"type": PY_TO_JSON[kind], "description": pname}
+            props[pname] = {"type": PY_TO_JSON[param_type(p)], "description": pname}
             if p.default is inspect.Parameter.empty:
                 required.append(pname)
         d = {"name": name, "description": (fn.__doc__ or name).strip()}
@@ -133,6 +136,47 @@ def declarations():
             d["parameters"] = {"type": "OBJECT", "properties": props, "required": required}
         out.append(d)
     return out
+
+
+def coerce_args(fn, args):
+    """Cast the model's arguments to the types the signature implies. The
+    schema already asks for the right types; this is the second lock, so a
+    string "false" for force= can never read as True."""
+    out = dict(args or {})
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return out
+    for k, v in out.items():
+        p = params.get(k)
+        if p is None or p.default is inspect.Parameter.empty:
+            continue
+        kind = param_type(p)
+        try:
+            if kind is bool and not isinstance(v, bool):
+                out[k] = str(v).strip().lower() not in FALSY
+            elif kind is int and not isinstance(v, bool):
+                out[k] = int(float(v))
+            elif kind is float:
+                out[k] = float(v)
+        except (TypeError, ValueError):
+            pass   # leave it; the tool reports its own error
+    return out
+
+
+def run_tools(calls):
+    """Execute one tool_call message's functions in order, off the event loop.
+    Order matters (find_on_screen -> move_mouse -> click), so they run
+    sequentially in a single worker thread."""
+    results = []
+    for call in calls:
+        fn = tools.TOOLS.get(call.name)
+        try:
+            result = fn(**coerce_args(fn, call.args)) if fn else {"error": "unknown tool"}
+        except Exception as e:
+            result = {"error": f"{type(e).__name__}: {e}"}
+        results.append(result)
+    return results
 
 
 def log(entry):
@@ -228,13 +272,12 @@ class Live:
 
                 tc = getattr(msg, "tool_call", None)
                 if tc and getattr(tc, "function_calls", None):
+                    calls = list(tc.function_calls)
+                    # Off the loop: a 45s screen read used to freeze mic, speaker
+                    # and the socket pump for its whole duration.
+                    results = await asyncio.to_thread(run_tools, calls)
                     responses = []
-                    for call in tc.function_calls:
-                        fn = tools.TOOLS.get(call.name)
-                        try:
-                            result = fn(**(call.args or {})) if fn else {"error": "unknown tool"}
-                        except Exception as e:
-                            result = {"error": f"{type(e).__name__}: {e}"}
+                    for call, result in zip(calls, results):
                         self.actions.append({"tool": call.name, "args": dict(call.args or {})})
                         responses.append(types.FunctionResponse(
                             id=call.id, name=call.name, response={"result": result}))
@@ -254,10 +297,11 @@ class Live:
                     start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW))
         except AttributeError:
             vad = None
+        known = memory.render()
         config = types.LiveConnectConfig(
             realtime_input_config=vad,
             response_modalities=["AUDIO"],
-            system_instruction=SYSTEM + ("\n\n" + memory.render() if memory.render() else ""),
+            system_instruction=SYSTEM + ("\n\n" + known if known else ""),
             tools=[{"function_declarations": declarations()}],
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
@@ -297,16 +341,29 @@ class Live:
         return status
 
 
+def is_live_pid(pid):
+    """True only if pid is a running Beckon live session -- not whatever
+    process happens to have been handed a stale PID since."""
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    return b"live.py" in cmdline
+
+
 def main():
     once = "--once" in sys.argv
 
     # F8 pressed while a session runs -> stop it
     if PIDFILE.exists() and "--force" not in sys.argv:
         try:
-            os.kill(int(PIDFILE.read_text().strip()), signal.SIGTERM)
-            PIDFILE.unlink(missing_ok=True)
-            notify("Session ended", "low")
-            return 0
+            pid = int(PIDFILE.read_text().strip())
+            if is_live_pid(pid):
+                os.kill(pid, signal.SIGTERM)
+                PIDFILE.unlink(missing_ok=True)
+                notify("Session ended", "low")
+                return 0
+            PIDFILE.unlink(missing_ok=True)   # stale: the PID belongs to something else now
         except (ValueError, ProcessLookupError):
             PIDFILE.unlink(missing_ok=True)
 

@@ -7,7 +7,6 @@ its actions, plays its line over the top, and moves on when both are done.
 The model's only job is to trigger it and stay quiet.
 """
 
-import os
 import shutil
 import socket
 import subprocess
@@ -17,42 +16,38 @@ import time
 import urllib.parse
 from pathlib import Path
 
+import common
 import narrate
 
 MUSIC = ("https://www.youtube.com/watch?v=SXZcd-j882k"
          "&list=RDSXZcd-j882k&start_radio=1&t=0s")
 DEMO_THEMES = ["Hackerman", "Catppuccin Latte", "Gruvbox", "Nord", "Matte Black"]
-HOME_THEME = "Tokyo Night"
 
 POST_TEXT = ("Posting this from Beckon — an open source voice agent built for "
              "Omarchy users. Gemini 3.1 live voice control for your desktop, and it "
              "can be adapted to other setups. github.com/Steven-Tibbs/beckon")
 
 
-def _setting(key, default):
-    """Read a value the user set in the panel's settings file, else the default.
-    Keeps machine-specific things (a dev server URL, a custom line) out of the
-    source and in ~/.config/beckon/settings.json, which is never committed."""
-    import json
-    try:
-        got = json.loads((Path.home() / ".config" / "beckon" / "settings.json").read_text())
-    except (OSError, ValueError):
-        return default
-    return got.get(key) or default
-
-
-DEV_URL = _setting("dev_url", "http://localhost:3000")   # set dev_url in settings.json
-DEV_LINE = _setting("dev_line",
-                    "I can even open your local dev server and run your tests for you. "
-                    "Here's the project you're working on.")
+# Machine-specific values come from ~/.config/beckon/settings.json (never
+# committed) via common.setting; these are the generic fallbacks.
+DEV_URL = common.setting("dev_url") or "http://localhost:3000"
+DEV_LINE = common.setting("dev_line") or (
+    "I can even open your local dev server and run your tests for you. "
+    "Here's the project you're working on.")
 FINAL_LINE = "That's the tour. Ask me to do anything and I'll take care of it."
 POST_LINE = ("I'm opening X now, with a post about this already drafted. "
              "Sending it is up to you — I never post on your behalf.")
 
-_running = threading.Event()
-STATE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "beckon"
+# tools.guided_tour reloads this module on every call. reload() re-executes the
+# file in the SAME module dict, so keep the existing Event if there is one --
+# a fresh Event each time would forget that a tour is already running.
+_running = globals().get("_running") or threading.Event()
+STATE = common.STATE
 MUTE = STATE / "mute"
 PANEL_URL = "http://127.0.0.1:8777/"
+
+_browser = common.browser
+_ydo = common.ydo
 
 
 def _lua(x):
@@ -83,7 +78,7 @@ def _focus_class(pattern):
 # --------------------------------------------------------------- step actions
 
 def _panel_open():
-    return _focus_class("Beckon") or _focus_class("Beckon")
+    return _focus_class("Beckon")
 
 
 def _ensure_server():
@@ -106,7 +101,7 @@ def _panel_to_ws2():
         time.sleep(0.2)
         _h('hl.dsp.window.move({ workspace = "2", follow = true })')
     else:
-        _h(f'hl.dsp.exec_cmd("uwsm-app -- google-chrome-stable --app={PANEL_URL}")')
+        _h(f'hl.dsp.exec_cmd("uwsm-app -- {_browser()} --app={PANEL_URL}")')
         time.sleep(3.5)
     time.sleep(0.3)
     _h('hl.dsp.focus({ workspace = "2" })')
@@ -133,7 +128,7 @@ def _click_at(x, y):
     _h(f"hl.dsp.cursor.move({{ x = {int(x)}, y = {int(y)}, absolute = true }})")
     time.sleep(0.25)
     if shutil.which("ydotool"):
-        _sh("ydotool", "click", "0xC0", wait=5)
+        _ydo("click", "0xC0")
         return True
     return False
 
@@ -141,7 +136,7 @@ def _click_at(x, y):
 def _music():
     _h('hl.dsp.focus({ workspace = "3" })')
     time.sleep(0.4)
-    _h(f'hl.dsp.exec_cmd("uwsm-app -- google-chrome-stable --new-window {MUSIC}")')
+    _h(f'hl.dsp.exec_cmd("uwsm-app -- {_browser()} --new-window {MUSIC}")')
     time.sleep(6.5)
     _mpris_play()   # no-op if it already autoplayed
 
@@ -163,40 +158,55 @@ def _themes():
     _h('hl.dsp.focus({ workspace = "4" })')
     time.sleep(0.3)
     for t in DEMO_THEMES:
-        _sh("omarchy", "theme", "set", t, wait=30)   # ~0.5s: reload + app retints
+        _set_theme(t)
         time.sleep(0.15)                              # just enough to register the change
 
 
 CLAUDE_THEME = "Rose Pine"     # shown while typing into Claude
-FINAL_THEME = "Matte Black"    # "the ship" -- where the tour leaves you
+FINAL_THEME = "Matte Black"    # "the ship" -- shown at the end, then the user's theme comes back
+
+
+def _current_theme():
+    """The user's theme before the tour touched it, so it can be put back."""
+    try:
+        return _sh("omarchy", "theme", "current", wait=10).stdout.strip() or None
+    except Exception:
+        return None
+
+
+def _set_theme(name):
+    if name and shutil.which("omarchy"):
+        _sh("omarchy", "theme", "set", name, wait=30)   # ~0.5s: reload + app retints
 
 
 def _back_to_claude():
     _h('hl.dsp.focus({ workspace = "1" })')
     time.sleep(0.5)
-    _focus_class("anthropic.Claude")
+    got = _focus_class("anthropic.Claude")
     time.sleep(0.5)
-    _sh("omarchy", "theme", "set", CLAUDE_THEME, wait=30)   # Claude recolours on screen
+    _set_theme(CLAUDE_THEME)   # Claude recolours on screen
     time.sleep(1.2)
-    _sh("wtype", "-d", "12", "Hello, World!", wait=15)
-    time.sleep(0.3)
-    _sh("wtype", "-k", "Return", wait=6)
-    time.sleep(1.2)
-    _sh("omarchy", "theme", "set", FINAL_THEME, wait=30)
+    # Type only if Claude really has focus -- otherwise the text lands in
+    # whatever is on workspace 1. And never press Return: the tour types, the
+    # user sends.
+    if got:
+        _sh("wtype", "-d", "12", "Hello, World!", wait=15)
+    time.sleep(1.5)
+    _set_theme(FINAL_THEME)
 
 
 def _post_to_x():
     """Open X's composer with the post pre-filled via the intent URL. No typing,
     no focus games -- the text is already there and the user presses Post."""
     url = "https://x.com/intent/post?text=" + urllib.parse.quote(POST_TEXT, safe="")
-    _h(f"hl.dsp.exec_cmd({_lua(f'uwsm-app -- google-chrome-stable --new-window {url}')})")
+    _h(f"hl.dsp.exec_cmd({_lua(f'uwsm-app -- {_browser()} --new-window {url}')})")
     time.sleep(6.0)
 
 def _dev_server():
     """Open the user's local dev server in its own window on a fresh workspace."""
     _h('hl.dsp.focus({ workspace = "5" })')
     time.sleep(0.4)
-    _h(f"hl.dsp.exec_cmd({_lua(f'uwsm-app -- google-chrome-stable --new-window {DEV_URL}')})")
+    _h(f"hl.dsp.exec_cmd({_lua(f'uwsm-app -- {_browser()} --new-window {DEV_URL}')})")
     time.sleep(5.0)
 
 
@@ -244,23 +254,40 @@ def _step(action, clip):
     time.sleep(0.5)
 
 
+def _clip(line, name):
+    """A narration clip, or None -- and say so once, out loud in the panel's
+    notification area, instead of running a silent tour with no explanation."""
+    clip = narrate.generate(line, name)
+    if clip is None and not _clip.warned:
+        _clip.warned = True
+        common.notify("Couldn't generate the tour narration -- check the API key "
+                      "and network. Running the tour without a voice.", "critical")
+    return clip
+
+
+_clip.warned = False
+
+
 def _run(post):
     STATE.mkdir(parents=True, exist_ok=True)
     MUTE.touch()          # the live mic ignores audio while this exists
+    home = _current_theme()   # put the user's own theme back afterwards
+    _clip.warned = False
     try:
         for i, (action, line) in enumerate(SCRIPT):
-            _step(action, narrate.generate(line, f"tour{i}"))
+            _step(action, _clip(line, f"tour{i}"))
         if post:
-            _step(_post_to_x, narrate.generate(POST_LINE, "tour_post"))
-        _step(_dev_server, narrate.generate(DEV_LINE, "tour_dev"))
-        _step(None, narrate.generate(FINAL_LINE, "tour_final"))   # closes on the dev-server page
+            _step(_post_to_x, _clip(POST_LINE, "tour_post"))
+        _step(_dev_server, _clip(DEV_LINE, "tour_dev"))
+        _step(None, _clip(FINAL_LINE, "tour_final"))   # closes on the dev-server page
     finally:
         time.sleep(0.8)   # let the last line's tail clear the speakers
+        _set_theme(home)
         MUTE.unlink(missing_ok=True)
         _running.clear()
 
 
-def guided_tour(post_to_x=True):
+def guided_tour(post_to_x=False):
     """Run the full guided demo tour. It narrates itself on a fixed timeline.
 
     Call this ONCE when the user asks for a tour or demo, then SAY NOTHING

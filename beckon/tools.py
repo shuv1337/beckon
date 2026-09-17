@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import common
 import memory
 
 
@@ -250,10 +251,7 @@ def _cursor():
     return int(x), int(y)
 
 
-def _ydo(*args):
-    import os
-    env = dict(os.environ, YDOTOOL_SOCKET=os.environ.get("YDOTOOL_SOCKET", "/tmp/.ydotool_socket"))
-    return subprocess.run(["ydotool", *args], capture_output=True, text=True, timeout=5, env=env)
+_ydo = common.ydo
 
 
 def _ydo_move(x, y):
@@ -363,16 +361,9 @@ def look_at_screen(question="What is on the screen?", mode="auto"):
     Returns a text answer. Costs a second or two, so prefer list_windows when
     the window title is enough.
     """
-    import os
-
-    key = (os.environ.get("GEMINI_API_KEY")
-           or os.environ.get("GOOGLE_API_KEY")
-           or _read_key())
-    if not key:
+    if not common.api_key():
         return {"error": "no API key"}
-
-    subprocess.run(["notify-send", "-a", "Beckon", "-t", "4000", "-u", "low",
-                    "Looking at your screen…", str(question)[:120]], check=False)
+    common.notify(str(question)[:120], "low", title="Looking at your screen…", ms=4000)
     pulse = _start_pulse()
     try:
         return _look(question, mode)
@@ -421,19 +412,34 @@ def _start_pulse():
     return stop
 
 
-def _look(question, mode="auto"):
+def _screenshot(monitor=None):
+    """Base64 PNG of one monitor (or the whole layout), or None. The temp file
+    is removed on every path, including a failed grim."""
     import base64
     import os
     import tempfile
-    import urllib.request
-    import json as _json
-    key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or _read_key())
-    if not key:
-        return {"error": "no API key"}
+    fd, shot = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        cmd = ["grim"] + (["-o", monitor] if monitor else []) + ["-t", "png", shot]
+        r = subprocess.run(cmd, capture_output=True, timeout=20)
+        if r.returncode != 0 or not os.path.getsize(shot):
+            return None
+        with open(shot, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    finally:
+        try:
+            os.unlink(shot)
+        except OSError:
+            pass
 
+
+def _look(question, mode="auto"):
     mode = str(mode or "auto").lower()
+    if mode not in ("auto", "image", "text"):
+        mode = "auto"
     page = {}
-    if mode in ("auto", "both", "text"):
+    if mode in ("auto", "text"):
         page = _page_text("")          # whole window, scrolled-off parts included
     if mode == "text":
         if page.get("text"):
@@ -442,17 +448,9 @@ def _look(question, mode="auto"):
                 "hint": "nothing to read here; call look_at_screen with mode='image'"}
 
     mon = next((m.get("name") for m in _query("monitors") if m.get("focused")), None)
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
-        shot = tf.name
-    cmd = ["grim"] + (["-o", mon] if mon else []) + ["-t", "png", shot]
-    r = subprocess.run(cmd, capture_output=True, timeout=20)
-    if r.returncode != 0 or not os.path.getsize(shot):
-        os.unlink(shot)
+    img = _screenshot(mon)
+    if not img:
         return {"error": "screenshot failed"}
-
-    with open(shot, "rb") as f:
-        img = base64.b64encode(f.read()).decode()
-    os.unlink(shot)
 
     parts = [{"text": "Answer concisely, in one or two sentences, as it will be "
                       "read aloud. Question: " + str(question)}]
@@ -462,24 +460,12 @@ def _look(question, mode="auto"):
                               "scrolled off screen:\n" + page["text"][:20000]})
     parts.append({"inline_data": {"mime_type": "image/png", "data": img}})
 
-    body = _json.dumps({"contents": [{"role": "user", "parts": parts}]}).encode()
-    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           "gemini-3.8-flash:generateContent?key=" + key)
-    req = urllib.request.Request(url, data=body,
-                                 headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            data = _json.loads(resp.read())
-        parts = data["candidates"][0]["content"]["parts"]
-        return " ".join(pt.get("text", "") for pt in parts).strip() or "(no answer)"
+        data = common.generate_content(common.setting("text_model"),
+                                       {"contents": [{"role": "user", "parts": parts}]})
+        return common.answer_text(data) or "(no answer)"
     except Exception as e:
         return {"error": f"{type(e).__name__}: {str(e)[:150]}"}
-
-
-def _read_key():
-    from pathlib import Path
-    f = Path.home() / ".config" / "beckon" / "api_key"
-    return f.read_text().strip() if f.exists() else None
 
 
 
@@ -509,43 +495,28 @@ def find_on_screen(description):
 
     This is THE way to click things: find_on_screen -> move_mouse -> click.
     """
-    import base64
-    import os
     import re
-    import tempfile
-    import urllib.request
-    import json as _json
-    key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or _read_key())
-    if not key:
+    if not common.api_key():
         return {"error": "no API key"}
     mon = next((m for m in _query("monitors") if m.get("focused")), None)
     if not mon:
         return {"error": "no focused monitor"}
-    subprocess.run(["notify-send", "-a", "Beckon", "-t", "3000", "-u", "low",
-                    "Finding on screen…", str(description)[:120]], check=False)
+    common.notify(str(description)[:120], "low", title="Finding on screen…", ms=3000)
     pulse = _start_pulse()
     try:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
-            shot = tf.name
-        r = subprocess.run(["grim", "-o", mon["name"], "-t", "png", shot], capture_output=True, timeout=20)
-        if r.returncode != 0:
+        img = _screenshot(mon["name"])
+        if not img:
             return {"error": "screenshot failed"}
-        img = base64.b64encode(open(shot, "rb").read()).decode()
-        os.unlink(shot)
         prompt = ("Locate this on the screenshot: " + str(description) + ". Reply with ONLY "
                   "the centre of it as a JSON object {\"x\": N, \"y\": N} where N is 0-1000, "
                   "x from the left edge, y from the top edge. If it is not visible reply "
                   "{\"error\": \"not found\"}.")
-        body = _json.dumps({"contents": [{"role": "user", "parts": [
-            {"text": prompt}, {"inline_data": {"mime_type": "image/png", "data": img}}]}]}).encode()
-        req = urllib.request.Request(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=" + key,
-            data=body, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            data = _json.loads(resp.read())
-        text = " ".join(pt.get("text", "") for pt in data["candidates"][0]["content"]["parts"])
+        data = common.generate_content(common.setting("text_model"), {"contents": [{
+            "role": "user", "parts": [
+                {"text": prompt}, {"inline_data": {"mime_type": "image/png", "data": img}}]}]})
+        text = common.answer_text(data)
         m = re.search(r"\{[^{}]*\}", text)
-        got = _json.loads(m.group(0)) if m else {}
+        got = json.loads(m.group(0)) if m else {}
         if "x" not in got or "y" not in got:
             return {"error": got.get("error", "could not locate it"), "raw": text[:120]}
         # normalised 0-1000 on the captured monitor -> Hyprland logical coordinates
@@ -626,8 +597,16 @@ _EV = {  # Linux evdev keycodes
     "XF86TOUCHPADTOGGLE": 530, "XF86TOUCHPADON": 531, "XF86TOUCHPADOFF": 532,
 }
 _MOD = {"SUPER": 125, "SHIFT": 42, "CTRL": 29, "ALT": 56}
-_DANGEROUS = ("lock", "shutdown", "shut down", "reboot", "restart", "log out", "logout",
-              "power off", "suspend", "hibernate", "close all")
+# Whole words, so "Restart Waybar" and "Toggle locking on idle" pass but "Lock
+# system", "Power", "Power menu" and "Close all windows" need force=True.
+_DANGEROUS = ("lock", "shutdown", "shut down", "reboot", "log out", "logout",
+              "power", "power off", "suspend", "hibernate", "close all")
+
+
+def _is_dangerous(name):
+    import re
+    n = str(name).lower()
+    return any(re.search(rf"\b{re.escape(d)}\b", n) for d in _DANGEROUS)
 
 
 def _keybinds():
@@ -678,7 +657,7 @@ def press_keybind(name, force=False):
         return {"error": f"no shortcut named '{name}'", "hint": "try list_keybinds"}
     if hit["name"].lower() == "close window":
         return close_window()                     # keep the Claude/panel guard
-    if any(d in hit["name"].lower() for d in _DANGEROUS) and not force:
+    if _is_dangerous(hit["name"]) and not force:
         return {"refused": f"'{hit['name']}' needs explicit confirmation from the user (force=True)"}
     if "mouse" in hit["key"].lower():
         return {"error": "that shortcut is a mouse chord; use move_mouse/click instead"}
@@ -723,26 +702,27 @@ def forget(target):
     return memory.forget(target)
 
 
-def guided_tour(post_to_x=True):
-    """Run the full guided demo tour. It narrates itself on a fixed timeline and
-    ends by typing -- never sending -- a post on X.
+def guided_tour(post_to_x=False):
+    """Run the full guided demo tour. It narrates itself on a fixed timeline.
 
-    Call this ONCE when the user asks for a tour or a demo, then SAY NOTHING at
-    all until they speak to you again: the tour does all the talking, and
-    anything you say will talk over it. Do not call other tools while it runs.
+    Call this ONCE only when the user clearly asked for a tour, a demo, or to
+    show them around -- never for "what can you do" or "help". Then SAY NOTHING
+    until they speak again. Do not call other tools while it runs.
+    Set post_to_x=true only if they explicitly asked to post about it.
     """
     import importlib
-    import os
-    from pathlib import Path
     import tour as _tour
-    mute = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "beckon" / "mute"
+    mute = common.STATE / "mute"
     if mute.exists():
         import time
         if time.time() - mute.stat().st_mtime < 150:   # a real tour finishes well inside this
             return {"status": "already running"}
         mute.unlink(missing_ok=True)                    # left over from a cancelled run
-    importlib.reload(_tour)   # pick up edits to the tour without restarting the session
-    return _tour.guided_tour(post_to_x)
+    # Pick up edits to the tour without restarting the session. tour._running
+    # survives this: reload re-runs the file in the same module dict and the
+    # file keeps an existing Event rather than making a new one.
+    importlib.reload(_tour)
+    return _tour.guided_tour(bool(post_to_x))
 
 
 TOOLS = {f.__name__: f for f in [

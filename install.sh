@@ -32,6 +32,11 @@ python3 -c "import gi" 2>/dev/null \
 mkdir -p "$DEST" "$BIN" "$HOME/.config/beckon"
 cp "$SRC"/*.py "$SRC"/*.html "$SRC"/*.qml "$DEST/"
 
+# Second lock against committing a key or local state (see .githooks/pre-commit).
+if git -C "$(dirname "$SRC")" rev-parse --git-dir >/dev/null 2>&1; then
+  git -C "$(dirname "$SRC")" config core.hooksPath .githooks
+fi
+
 cat > "$BIN/beckon" <<'LAUNCH'
 #!/bin/bash
 case "${1:-live}" in

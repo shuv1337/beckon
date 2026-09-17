@@ -118,9 +118,10 @@ one worked, and the pitfalls. A prompt that works:
 | `beckon ui` | control panel: API key, voice, custom tools, history |
 | *"give me a guided tour"* | the demo — it narrates itself |
 
-The tour's last step opens a local dev server. Point it at yours by putting
-`"dev_url": "http://localhost:3000"` (and optionally `"dev_line"` for what it
-says over it) in `~/.config/beckon/settings.json`.
+The tour's last step opens a local dev server. Point it at yours from the
+panel's *Voice & model* section, or put `"dev_url": "http://localhost:3000"`
+(and optionally `"dev_line"` for what it says over it) in
+`~/.config/beckon/settings.json`. The tour puts your theme back when it ends.
 
 ## Privacy
 
@@ -208,6 +209,10 @@ def lock_screen():
 
 Pull requests are welcome. Fork, branch, open a PR — nothing lands on `master`
 without review by the maintainer, and direct pushes are limited to the owner.
+
+Run `pytest` from the repo root before opening one. `install.sh` enables the
+pre-commit hook in `.githooks/` that refuses to commit keys or local state; on
+a clone you didn't install from, run `git config core.hooksPath .githooks`.
 
 ## License
 

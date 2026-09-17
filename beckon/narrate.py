@@ -5,24 +5,14 @@ speaks from cached WAVs instead. Generated once, reused forever.
 """
 
 import base64
-import json
 import struct
 import subprocess
-import urllib.request
 from pathlib import Path
 
+import common
+
 CACHE = Path.home() / ".cache" / "beckon" / "narration"
-MODEL = "gemini-3.1-flash-tts-preview"
 VOICE = "Puck"
-
-
-def _key():
-    import os
-    k = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if k:
-        return k.strip()
-    f = Path.home() / ".config" / "beckon" / "api_key"
-    return f.read_text().strip() if f.exists() else None
 
 
 def _wav(pcm, rate=24000):
@@ -41,26 +31,22 @@ def generate(text, name, voice=VOICE):
     if out.exists() and out.stat().st_size > 2000:
         return out
 
-    key = _key()
-    if not key:
+    if not common.api_key():
         return None
-    body = json.dumps({
+    body = {
         "contents": [{"parts": [{"text": text}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {"voiceConfig": {
                 "prebuiltVoiceConfig": {"voiceName": voice}}},
         },
-    }).encode()
-    req = urllib.request.Request(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={key}",
-        data=body, headers={"Content-Type": "application/json"})
+    }
     import time
-    for attempt, pause in enumerate((0, 3, 8)):
+    for pause in (0, 3, 8):
         if pause:
             time.sleep(pause)      # the TTS endpoint rate-limits bursts
         try:
-            d = json.loads(urllib.request.urlopen(req, timeout=90).read())
+            d = common.generate_content(common.setting("tts_model"), body, timeout=90)
             part = d["candidates"][0]["content"]["parts"][0]["inlineData"]
             out.write_bytes(_wav(base64.b64decode(part["data"])))
             return out
@@ -80,6 +66,11 @@ def duration(path):
 
 
 def play(path, block=True):
+    if not path or not Path(path).exists():
+        if block:
+            import time
+            time.sleep(3)
+        return None
     p = subprocess.Popen(["paplay", str(path)],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if block:
