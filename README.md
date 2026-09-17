@@ -214,6 +214,12 @@ Run `pytest` from the repo root before opening one. `install.sh` enables the
 pre-commit hook in `.githooks/` that refuses to commit keys or local state; on
 a clone you didn't install from, run `git config core.hooksPath .githooks`.
 
+Changes to the prompt, tool schema or model settings should also be measured:
+`python3 evals/run.py` runs the spoken-command cases in `evals/cases.jsonl`
+against a real Live session with a fake desktop (needs your API key, costs a
+few cents), and `python3 evals/compare.py before.json after.json` shows what
+moved. Current numbers are in `evals/results/BASELINES.md`.
+
 ## License
 
 MIT

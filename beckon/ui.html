@@ -92,6 +92,9 @@ input:focus,select:focus{border-color:var(--accent)}
 .turn .foot{display:flex;gap:7px;align-items:center;margin-top:8px;flex-wrap:wrap}
 .chip{font:500 10.5px var(--mono);padding:3px 7px;border-radius:5px;
   background:#6e9fff12;border:1px solid #6e9fff28;color:var(--accent)}
+.chip.bad{background:#f0b42912;border-color:#f0b42940;color:var(--warn)}
+.chip small{opacity:.6;margin-left:4px}
+.turn .meta{font:400 10.5px var(--mono);color:var(--faint)}
 .turn time{font:400 11px var(--mono);color:var(--faint);margin-left:auto}
 #log{max-height:400px;overflow-y:auto}
 .none{color:var(--faint);font-size:13px;padding:20px 0;text-align:center}
@@ -283,7 +286,8 @@ async function load(){
     <div class="turn">
       <div class="q">${esc(h.heard)}</div>
       ${h.reply?`<div class="a">${esc(h.reply)}</div>`:''}
-      <div class="foot">${(h.actions||[]).map(a=>`<span class="chip">${esc(a.tool)}</span>`).join('')}
+      <div class="foot">${(h.actions||[]).map(a=>`<span class="chip${a.ok===false?' bad':''}">${esc(a.tool)}${a.ms!=null?`<small>${a.ms}ms</small>`:''}</span>`).join('')}
+        ${h.model||h.turn_ms!=null?`<span class="meta">${esc(h.model||'')}${h.turn_ms!=null?` · ${(h.turn_ms/1000).toFixed(1)}s`:''}${h.usage?.total!=null?` · ${h.usage.total} tok`:''}</span>`:''}
         <time>${esc((h.ts||'').replace('T',' ').slice(5))}</time></div>
     </div>`).join(''):'<div class="none">Nothing yet. Press F8 and say hello.</div>';
 }

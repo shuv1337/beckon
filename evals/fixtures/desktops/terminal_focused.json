@@ -1,0 +1,14 @@
+{
+  "base": "two_windows",
+  "windows": [
+    {"address": "0x1", "class": "google-chrome", "title": "Inbox (3) - Gmail",
+     "workspace": {"name": "1"}, "monitor": 0, "floating": false},
+    {"address": "0x2", "class": "code", "title": "live.py - beckon - Visual Studio Code",
+     "workspace": {"name": "1"}, "monitor": 0, "floating": false},
+    {"address": "0x3", "class": "Alacritty", "title": "~/repos/beckon",
+     "workspace": {"name": "1"}, "monitor": 0, "floating": false}
+  ],
+  "active": "0x3",
+  "page_text": null,
+  "screen_answer": "A terminal showing a Python traceback: ModuleNotFoundError: No module named 'sounddevice' on line 28 of live.py."
+}

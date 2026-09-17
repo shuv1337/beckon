@@ -1,0 +1,8 @@
+{
+  "base": "two_windows",
+  "memory": {
+    "preferences": {"email": "https://mail.google.com", "music": "spotify", "editor": "code",
+                    "name": "Shuv"},
+    "notes": [{"ts": "2026-09-10", "text": "working on the checkout page redesign"}]
+  }
+}

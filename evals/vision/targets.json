@@ -1,0 +1,7 @@
+{
+  "_comment": "Per screenshot name (evals/vision/<name>.png, gitignored): things find_on_screen must locate. bbox is [x0, y0, x1, y1] in PNG pixels. Capture with `python3 evals/vision.py capture <name>`, then fill this in.",
+  "_example": [
+    {"describe": "the Compose button", "bbox": [40, 180, 260, 240]},
+    {"describe": "the first email in the inbox", "bbox": [560, 320, 2400, 380]}
+  ]
+}

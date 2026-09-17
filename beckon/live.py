@@ -16,6 +16,7 @@ import os
 import signal
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -46,6 +47,11 @@ BARGE_IN = os.environ.get("BECKON_BARGE_IN") == "1"
 SPEAK_TAIL = 0.4   # seconds to keep the mic closed after playback drains
 
 IN_RATE, OUT_RATE, CHUNK = 16000, 24000, 1024
+
+# Every history entry carries these, so turns can be grouped by session and
+# compared across models when settings change between runs.
+PROVIDER = "gemini"
+SESSION_ID = uuid.uuid4().hex[:12]
 
 SYSTEM = """You are Beckon, a desktop agent with real tools that open apps and sites,
 move windows, type, and click. You are NOT "just a voice model": when the user
@@ -122,10 +128,11 @@ def param_type(p):
     return str
 
 
-def declarations():
-    """Build Gemini function declarations from tools.TOOLS."""
+def declarations(registry=None):
+    """Build Gemini function declarations from a tool registry (tools.TOOLS by
+    default; the eval harness passes a fake desktop's registry)."""
     out = []
-    for name, fn in tools.TOOLS.items():
+    for name, fn in (registry if registry is not None else tools.TOOLS).items():
         props, required = {}, []
         for pname, p in inspect.signature(fn).parameters.items():
             props[pname] = {"type": PY_TO_JSON[param_type(p)], "description": pname}
@@ -164,19 +171,70 @@ def coerce_args(fn, args):
     return out
 
 
-def run_tools(calls):
+def run_tools(calls, registry=None):
     """Execute one tool_call message's functions in order, off the event loop.
     Order matters (find_on_screen -> move_mouse -> click), so they run
     sequentially in a single worker thread."""
+    reg = registry if registry is not None else tools.TOOLS
     results = []
     for call in calls:
-        fn = tools.TOOLS.get(call.name)
+        fn = reg.get(call.name)
+        t0 = time.monotonic()
         try:
             result = fn(**coerce_args(fn, call.args)) if fn else {"error": "unknown tool"}
         except Exception as e:
             result = {"error": f"{type(e).__name__}: {e}"}
-        results.append(result)
+        results.append({"result": result, "ms": int((time.monotonic() - t0) * 1000),
+                        "ok": tool_ok(result)})
     return results
+
+
+def tool_ok(result):
+    """A tool 'failed' if it reported an error or refused; anything else counts."""
+    return not (isinstance(result, dict) and ("error" in result or "refused" in result))
+
+
+def live_config(voice=None, known=None, tool_decls=None):
+    """The LiveConnectConfig a real session uses. The eval harness calls this
+    too, so what gets measured is exactly what gets shipped: same prompt, same
+    tool schema, same VAD and transcription settings.
+
+    voice/known/tool_decls default to the live session's values; the harness
+    passes known="" so a run is not coloured by whatever is in memory.json.
+    """
+    try:   # be less trigger-happy about faint bleed-through counting as speech
+        vad = types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW))
+    except AttributeError:
+        vad = None
+    if known is None:
+        known = memory.render()
+    return types.LiveConnectConfig(
+        realtime_input_config=vad,
+        response_modalities=["AUDIO"],
+        system_instruction=SYSTEM + ("\n\n" + known if known else ""),
+        tools=[{"function_declarations": tool_decls if tool_decls is not None else declarations()}],
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice or VOICE))),
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
+        # let the API manage context instead of us trimming by hand
+        context_window_compression=types.ContextWindowCompressionConfig(
+            sliding_window=types.SlidingWindow()),
+    )
+
+
+def usage_dict(um):
+    """Flatten usage_metadata to plain ints; None fields are dropped."""
+    out = {}
+    for k in ("prompt_token_count", "response_token_count", "total_token_count",
+              "thoughts_token_count", "tool_use_prompt_token_count"):
+        v = getattr(um, k, None)
+        if isinstance(v, int):
+            out[k.removesuffix("_token_count")] = v
+    return out
 
 
 def log(entry):
@@ -188,6 +246,10 @@ def log(entry):
     """
     entry["ts"] = datetime.now().isoformat(timespec="seconds")
     entry["via"] = "live"
+    entry["session"] = SESSION_ID
+    entry["provider"] = PROVIDER
+    entry["model"] = MODEL
+    entry["voice"] = VOICE
     fd = os.open(HISTORY, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a") as f:
         f.write(json.dumps(entry) + "\n")
@@ -200,6 +262,8 @@ class Live:
         self.out_q = asyncio.Queue()
         self.said, self.heard, self.actions = [], [], []
         self.last_played = 0.0
+        self.turn_started = None   # first sign of the user's turn, for turn_ms
+        self.usage = None          # last usage_metadata seen this turn
 
     def model_speaking(self):
         """True while model audio is queued/playing (plus a short tail)."""
@@ -240,6 +304,11 @@ class Live:
         while not self.stop.is_set():
             async for msg in session.receive():
                 sc = getattr(msg, "server_content", None)
+                if self.turn_started is None and (sc or getattr(msg, "tool_call", None)):
+                    self.turn_started = time.monotonic()
+                um = getattr(msg, "usage_metadata", None)
+                if um:
+                    self.usage = usage_dict(um)
 
                 if getattr(msg, "data", None) and not MUTE.exists():
                     self.last_played = time.monotonic()   # close the mic the moment audio arrives
@@ -259,14 +328,7 @@ class Live:
                             self.out_q.get_nowait()
 
                     if getattr(sc, "turn_complete", None):
-                        heard = "".join(self.heard).strip()
-                        said = "".join(self.said).strip()
-                        if heard or said or self.actions:
-                            log({"heard": heard, "reply": said, "actions": self.actions})
-                            print(f"  you: {heard}\n  beckon: {said}"
-                                  + (f"\n  ran: {[a['tool'] for a in self.actions]}"
-                                     if self.actions else ""))
-                        self.heard, self.said, self.actions = [], [], []
+                        self.finish_turn()
                         if self.once:
                             self.stop.set()
 
@@ -277,11 +339,30 @@ class Live:
                     # and the socket pump for its whole duration.
                     results = await asyncio.to_thread(run_tools, calls)
                     responses = []
-                    for call, result in zip(calls, results):
-                        self.actions.append({"tool": call.name, "args": dict(call.args or {})})
+                    for call, r in zip(calls, results):
+                        self.actions.append({"tool": call.name, "args": dict(call.args or {}),
+                                             "ms": r["ms"], "ok": r["ok"]})
                         responses.append(types.FunctionResponse(
-                            id=call.id, name=call.name, response={"result": result}))
+                            id=call.id, name=call.name, response={"result": r["result"]}))
                     await session.send_tool_response(function_responses=responses)
+
+    def finish_turn(self):
+        """Log one completed turn -- transcripts, tool calls with timings, token
+        usage, wall time -- then reset for the next one."""
+        heard = "".join(self.heard).strip()
+        said = "".join(self.said).strip()
+        if heard or said or self.actions:
+            entry = {"heard": heard, "reply": said, "actions": self.actions}
+            if self.turn_started is not None:
+                entry["turn_ms"] = int((time.monotonic() - self.turn_started) * 1000)
+            if self.usage:
+                entry["usage"] = self.usage
+            log(entry)
+            ran = "".join(f"\n  ran: {a['tool']} {a['ms']}ms{'' if a['ok'] else ' FAILED'}"
+                          for a in self.actions)
+            print(f"  you: {heard}\n  beckon: {said}{ran}")
+        self.heard, self.said, self.actions = [], [], []
+        self.turn_started, self.usage = None, None
 
     async def run(self):
         key = api_key()
@@ -291,27 +372,7 @@ class Live:
             return 1
 
         client = genai.Client(api_key=key)
-        try:   # be less trigger-happy about faint bleed-through counting as speech
-            vad = types.RealtimeInputConfig(
-                automatic_activity_detection=types.AutomaticActivityDetection(
-                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW))
-        except AttributeError:
-            vad = None
-        known = memory.render()
-        config = types.LiveConnectConfig(
-            realtime_input_config=vad,
-            response_modalities=["AUDIO"],
-            system_instruction=SYSTEM + ("\n\n" + known if known else ""),
-            tools=[{"function_declarations": declarations()}],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE))),
-            input_audio_transcription=types.AudioTranscriptionConfig(),
-            output_audio_transcription=types.AudioTranscriptionConfig(),
-            # let the API manage context instead of us trimming by hand
-            context_window_compression=types.ContextWindowCompressionConfig(
-                sliding_window=types.SlidingWindow()),
-        )
+        config = live_config()
 
         PIDFILE.write_text(str(os.getpid()))
         MUTE.unlink(missing_ok=True)   # a cancelled tour must not leave us deaf

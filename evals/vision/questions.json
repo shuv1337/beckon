@@ -1,0 +1,7 @@
+{
+  "_comment": "Per screenshot name: questions look_at_screen must answer. A hit is any expect_any string in the reply (case-insensitive). Optional page_text is passed as the window's full text, as the real tool does in auto mode.",
+  "_example": [
+    {"ask": "what colour is the Compose button", "expect_any": ["blue"]},
+    {"ask": "how many unread emails are there", "expect_any": ["3", "three"]}
+  ]
+}

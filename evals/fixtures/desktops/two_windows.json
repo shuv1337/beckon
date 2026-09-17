@@ -1,0 +1,51 @@
+{
+  "monitors": [
+    {"name": "eDP-1", "width": 2560, "height": 1600, "scale": 2.0, "x": 0, "y": 0,
+     "focused": true, "activeWorkspace": {"name": "1"}},
+    {"name": "DP-1", "width": 3840, "height": 2160, "scale": 1.5, "x": 1280, "y": 0,
+     "focused": false, "activeWorkspace": {"name": "2"}}
+  ],
+  "windows": [
+    {"address": "0x1", "class": "google-chrome", "title": "Inbox (3) - Gmail",
+     "workspace": {"name": "1"}, "monitor": 0, "floating": false},
+    {"address": "0x2", "class": "code", "title": "live.py - beckon - Visual Studio Code",
+     "workspace": {"name": "1"}, "monitor": 0, "floating": false}
+  ],
+  "active": "0x1",
+  "installed": ["google-chrome-stable", "code", "alacritty", "nautilus", "spotify", "slack"],
+  "clipboard": "call 555-0142 before 5",
+  "page_text": null,
+  "screen_answer": "The screen shows a Gmail inbox on the left and a code editor on the right.",
+  "find": {
+    "first email": {"x": 420, "y": 260},
+    "compose": {"x": 60, "y": 120},
+    "search": {"x": 640, "y": 40}
+  },
+  "keybinds": [
+    "SUPER + Return → Terminal",
+    "SUPER + B → Browser",
+    "SUPER + F → File manager",
+    "SUPER + M → Music",
+    "SUPER + T → Activity monitor",
+    "SUPER SHIFT + S → Screenshot",
+    "SUPER + Period → Emojis",
+    "SUPER + V → Clipboard manager",
+    "SUPER + J → Toggle window split",
+    "SUPER + W → Close window",
+    "SUPER + Escape → Lock system",
+    "SUPER SHIFT + Escape → Power menu",
+    "SUPER SHIFT + P → Toggle locking on idle",
+    "SUPER CTRL + Space → Restart Waybar",
+    "XF86AudioMute → Mute",
+    "XF86AudioRaiseVolume → Volume up",
+    "XF86AudioLowerVolume → Volume down",
+    "SUPER + 1 → Workspace 1",
+    "SUPER + 2 → Workspace 2"
+  ],
+  "memory": {"preferences": {}, "notes": []},
+  "custom_tools": [
+    {"name": "deploy_site",
+     "description": "Deploy the website to production. Use when the user asks to deploy, ship, or push the site live.",
+     "args": []}
+  ]
+}

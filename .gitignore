@@ -17,6 +17,12 @@ narration/
 *.wav
 *.log
 
+# eval runs are local; only the curated baselines table is tracked.
+# vision screenshots are captures of YOUR desktop -- never committed.
+evals/results/*
+!evals/results/BASELINES.md
+evals/vision/**/*.png
+
 # editor / tooling
 .claude/
 .vscode/

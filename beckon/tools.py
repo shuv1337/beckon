@@ -452,12 +452,18 @@ def _look(question, mode="auto"):
     if not img:
         return {"error": "screenshot failed"}
 
+    return _ask_vision(question, img, page.get("text"))
+
+
+def _ask_vision(question, img, page_text=None):
+    """Answer `question` about a base64 PNG (plus the window's full text when
+    known). Split out so the vision eval runs the shipped prompt on fixtures."""
     parts = [{"text": "Answer concisely, in one or two sentences, as it will be "
                       "read aloud. Question: " + str(question)}]
-    if page.get("text"):
+    if page_text:
         # the screenshot shows only the visible part; this is the whole thing
         parts.append({"text": "Full text of this window, including what is "
-                              "scrolled off screen:\n" + page["text"][:20000]})
+                              "scrolled off screen:\n" + page_text[:20000]})
     parts.append({"inline_data": {"mime_type": "image/png", "data": img}})
 
     try:
@@ -495,7 +501,6 @@ def find_on_screen(description):
 
     This is THE way to click things: find_on_screen -> move_mouse -> click.
     """
-    import re
     if not common.api_key():
         return {"error": "no API key"}
     mon = next((m for m in _query("monitors") if m.get("focused")), None)
@@ -507,18 +512,9 @@ def find_on_screen(description):
         img = _screenshot(mon["name"])
         if not img:
             return {"error": "screenshot failed"}
-        prompt = ("Locate this on the screenshot: " + str(description) + ". Reply with ONLY "
-                  "the centre of it as a JSON object {\"x\": N, \"y\": N} where N is 0-1000, "
-                  "x from the left edge, y from the top edge. If it is not visible reply "
-                  "{\"error\": \"not found\"}.")
-        data = common.generate_content(common.setting("text_model"), {"contents": [{
-            "role": "user", "parts": [
-                {"text": prompt}, {"inline_data": {"mime_type": "image/png", "data": img}}]}]})
-        text = common.answer_text(data)
-        m = re.search(r"\{[^{}]*\}", text)
-        got = json.loads(m.group(0)) if m else {}
+        got = _locate(description, img)
         if "x" not in got or "y" not in got:
-            return {"error": got.get("error", "could not locate it"), "raw": text[:120]}
+            return {"error": got.get("error", "could not locate it"), "raw": got.get("raw", "")}
         # normalised 0-1000 on the captured monitor -> Hyprland logical coordinates
         scale = float(mon.get("scale") or 1)
         lw, lh = mon["width"] / scale, mon["height"] / scale
@@ -529,6 +525,30 @@ def find_on_screen(description):
         return {"error": f"{type(e).__name__}: {str(e)[:120]}"}
     finally:
         pulse.set()
+
+
+def _locate(description, img):
+    """Ask the vision model where `description` is on a base64 PNG. Returns
+    {"x", "y"} normalised 0-1000 from the top-left, or {"error", "raw"}.
+    Split out so the vision eval scores the shipped prompt on fixtures."""
+    import re
+    prompt = ("Locate this on the screenshot: " + str(description) + ". Reply with ONLY "
+              "the centre of it as a JSON object {\"x\": N, \"y\": N} where N is 0-1000, "
+              "x from the left edge, y from the top edge. If it is not visible reply "
+              "{\"error\": \"not found\"}.")
+    data = common.generate_content(common.setting("text_model"), {"contents": [{
+        "role": "user", "parts": [
+            {"text": prompt}, {"inline_data": {"mime_type": "image/png", "data": img}}]}]})
+    text = common.answer_text(data)
+    m = re.search(r"\{[^{}]*\}", text)
+    try:
+        got = json.loads(m.group(0)) if m else {}
+    except json.JSONDecodeError:
+        got = {}
+    if not isinstance(got, dict) or "x" not in got or "y" not in got:
+        return {"error": (got.get("error") if isinstance(got, dict) else None) or "could not locate it",
+                "raw": text[:120]}
+    return {"x": got["x"], "y": got["y"]}
 
 
 # ================================================================= page text
@@ -610,11 +630,17 @@ def _is_dangerous(name):
 
 
 def _keybinds():
-    """Parse the live table into [{'chord','mods','key','name'}]."""
+    """The user's live keybind table as [{'chord','mods','key','name'}]."""
     r = subprocess.run(["omarchy", "menu", "keybindings", "--print"],
                        capture_output=True, text=True, timeout=15)
+    return _parse_keybinds(r.stdout)
+
+
+def _parse_keybinds(text):
+    """Parse `omarchy menu keybindings --print` output. Split out so the eval
+    harness can feed it a canned table."""
     out = []
-    for line in r.stdout.splitlines():
+    for line in text.splitlines():
         if "\u2192" not in line:
             continue
         chord, _, name = line.partition("\u2192")
@@ -626,6 +652,15 @@ def _keybinds():
             mods, key = [], chord
         out.append({"chord": chord, "mods": mods, "key": key, "name": name})
     return out
+
+
+def _match_keybind(name, rows):
+    """Resolve a spoken shortcut name to a row: exact name, then substring,
+    then the chord itself with spaces ignored ('super+v')."""
+    want = str(name).lower().strip()
+    return next((b for b in rows if b["name"].lower() == want), None) \
+        or next((b for b in rows if want in b["name"].lower()), None) \
+        or next((b for b in rows if want.replace(" ", "") == b["chord"].lower().replace(" ", "")), None)
 
 
 def list_keybinds(query=""):
@@ -648,11 +683,7 @@ def press_keybind(name, force=False):
     windows are refused unless force=True -- pass that only when the user
     explicitly asked for that exact action."""
     import shutil
-    want = str(name).lower().strip()
-    rows = _keybinds()
-    hit = next((b for b in rows if b["name"].lower() == want), None) \
-        or next((b for b in rows if want in b["name"].lower()), None) \
-        or next((b for b in rows if want.replace(" ", "") == b["chord"].lower().replace(" ", "")), None)
+    hit = _match_keybind(name, _keybinds())
     if not hit:
         return {"error": f"no shortcut named '{name}'", "hint": "try list_keybinds"}
     if hit["name"].lower() == "close window":
@@ -795,6 +826,9 @@ def load_custom_tools():
     return out
 
 
+# Snapshot before the user's own tools are merged in, so the eval harness can
+# run against exactly the shipped tool set regardless of the local config.
+BUILTIN_TOOLS = dict(TOOLS)
 TOOLS.update(load_custom_tools())
 
 

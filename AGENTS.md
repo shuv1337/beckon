@@ -140,7 +140,26 @@ Independent project built for Omarchy users — not affiliated with Omarchy, Hyp
 - **Tests** live in `tests/`; run `pytest` from the repo root. They cover the
   schema builder, argument coercion, the dangerous-bind matcher, private file
   writes, memory caps, settings parsing and custom-tool quoting. Nothing in
-  them touches Hyprland, audio or the network.
+  them touches Hyprland, audio or the network. `tests/test_evals.py` guards
+  the eval harness the same way (fake schema == shipped schema, sandboxed
+  memory, scorer matchers, case file well-formed).
+- **Evals** live in `evals/` and DO use the network -- they are not part of
+  `pytest`. `evals/run.py` opens one real Live session per case in
+  `evals/cases.jsonl`, swaps `tools.TOOLS` for a `FakeDesktop` (answers from
+  `evals/fixtures/desktops/*.json`, records every call), sends the utterance
+  as text (`--input audio` streams a TTS rendering instead), and scores with
+  `evals/score.py`. `evals/compare.py A.json B.json` diffs two runs.
+  `evals/vision.py` scores `find_on_screen`/`look_at_screen` prompts on local
+  screenshots (never committed). Every behaviour change in `PLAN.md` is gated
+  on these; record baselines in `evals/results/BASELINES.md`. Seams that exist
+  only for the harness: `tools.BUILTIN_TOOLS`, `tools._parse_keybinds`,
+  `tools._match_keybind`, `tools._locate`, `tools._ask_vision`,
+  `live.live_config()`, and the `registry=` argument on `live.declarations`
+  / `live.run_tools`. Keep them.
+- **History telemetry.** Each `history.jsonl` turn carries `session`,
+  `provider`, `model`, `voice`, `heard`, `reply`, `actions` (each with `tool`,
+  `args`, `ms`, `ok`), `turn_ms` and `usage` (`prompt`/`response`/`total`
+  tokens). The panel reads `actions` by that name -- don't rename it.
 - **Pre-commit hook.** `install.sh` sets `core.hooksPath .githooks` on the
   clone it runs from; on any other clone run that `git config` by hand.
 
@@ -161,6 +180,15 @@ Independent project built for Omarchy users — not affiliated with Omarchy, Hyp
 - X's post editor drops characters under fast synthetic typing. Put the text
   on the clipboard with `wl-copy` and paste with Ctrl+V instead of `wtype`-ing it.
 - The Gemini TTS endpoint rate-limits bursts; `narrate.generate` retries.
+- The TTS endpoint also blocks bare imperatives ("set the volume to fifty
+  percent") as `PROHIBITED_CONTENT` -- no `candidates` in the reply, not an
+  error. Framing the text as something to be read aloud passes. It also
+  sometimes mis-renders ("lock the screen" came out as "walk the screen"), so
+  `evals/run.py` transcribes every generated clip with `text_model` and
+  regenerates under another frame if it doesn't say the utterance
+  (`.ok`/`.bad` verdicts cached next to the clip).
+- Live VAD missed a 1.6 s clip streamed at 2x real time with a 1 s silent
+  tail. Real-time pacing + 1.5 s tail + `audio_stream_end=True` is reliable.
 - Do NOT kill Chrome's main process to restart it -- it leaves a stale
   `~/.config/google-chrome/SingletonLock` pointing at the dead PID and every
   later launch then hangs silently with no window and no error. Close the window
