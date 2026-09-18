@@ -192,8 +192,7 @@ async def one_turn(session, fd, opt):
                 ot = getattr(sc, "output_transcription", None)
                 if ot and getattr(ot, "text", None):
                     said.append(ot.text)
-                if getattr(sc, "turn_complete", None) or \
-                        getattr(sc, "interaction_status", None) == types.InteractionStatus.IDLE:
+                if live.turn_is_complete(sc):
                     last_complete = time.monotonic()
             if tc and getattr(tc, "function_calls", None):
                 fcs = list(tc.function_calls)
@@ -210,9 +209,11 @@ async def one_turn(session, fd, opt):
 
     # First pass: up to the case budget (a screen read can legitimately take a
     # while). Follow-up passes only wait `settle` seconds for a post-tool reply.
+    # Keep going while last_complete is still None so a filler turn_complete
+    # that ended the SDK stream does not cut off the real tool+IDLE turn.
     finished = await one_pass(opt.timeout)
     passes = 1
-    while finished and last_tool and (last_complete is None or last_tool > last_complete) \
+    while finished and (last_complete is None or (last_tool and last_tool > last_complete)) \
             and passes < 4 and time.monotonic() < deadline:
         finished = await one_pass(opt.settle)
         passes += 1
@@ -229,8 +230,6 @@ async def run_case(client, case, opt):
     fd = FakeDesktop(case["desktop"])
     with fd.installed():
         decls = live.declarations(fd.tools)
-        if opt.non_blocking:
-            decls = [dict(d, behavior="NON_BLOCKING") for d in decls]
         config = live_config_for(opt, memory.render(), decls)
         row = {"id": case["id"], "cat": case["cat"], "say": case["say"], "turns": [],
                "calls": [], "reply": "", "heard": "", "usage": None, "turn_ms": 0,
@@ -271,11 +270,16 @@ async def run_case(client, case, opt):
 
 
 def live_config_for(opt, known, decls):
-    config = live.live_config(voice=opt.voice, known=known, tool_decls=decls)
-    if opt.thinking:
-        config.thinking_config = types.ThinkingConfig(
-            thinking_level=getattr(types.ThinkingLevel, opt.thinking.upper()))
-    return config
+    """Build LiveConnectConfig the same way a real session does.
+
+    thinking=None means "use the model's default" so evals do not inherit
+    the user's settings.json. --non-blocking True forces the stamp; otherwise
+    MODEL_CAPS decides.
+    """
+    return live.live_config(
+        voice=opt.voice, known=known, tool_decls=decls,
+        model=opt.model, thinking=opt.thinking,
+        non_blocking=True if opt.non_blocking else None)
 
 
 def git_rev():
@@ -344,8 +348,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--provider", default="gemini", choices=["gemini"],
                     help="only gemini until PLAN.md phase 7/8")
-    ap.add_argument("--model", default=live.MODEL)
-    ap.add_argument("--voice", default=live.VOICE)
+    # DEFAULTS, not live.MODEL / live.VOICE: those inherit settings.json.
+    ap.add_argument("--model", default=common.DEFAULTS["model"])
+    ap.add_argument("--voice", default=common.DEFAULTS["voice"])
     ap.add_argument("--thinking", default=None, choices=[None, "low", "medium", "high"],
                     help="thinking_level (models that support it)")
     ap.add_argument("--non-blocking", action="store_true",
