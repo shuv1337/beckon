@@ -11,6 +11,8 @@ import json
 import os
 import stat
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -193,9 +195,19 @@ def _decl_behaviors(config):
     return out
 
 
+def _beh(b):
+    s = str(b or "")
+    if "NON_BLOCKING" in s:
+        return "NON_BLOCKING"
+    if "BLOCKING" in s:
+        return "BLOCKING"
+    return None
+
+
 def test_live_config_follows_model_caps():
     # thinking=None uses resolved_thinking, not settings.json.
-    decls = [{"name": "list_windows", "description": "list"}]
+    decls = [{"name": "list_windows", "description": "list"},
+             {"name": "click", "description": "click"}]
     for name, caps in common.MODEL_CAPS.items():
         cfg = live.live_config(model=name, thinking=None, voice="Puck",
                                known="", tool_decls=decls)
@@ -204,11 +216,14 @@ def test_live_config_follows_model_caps():
             assert level and "MEDIUM" in str(level).upper()
         else:
             assert level is None
-        behaviors = [b for _, b in _decl_behaviors(cfg)]
-        if caps["tools"] == "non_blocking":
-            assert behaviors and all(b and "NON_BLOCKING" in str(b) for b in behaviors)
+        behaviors = {n: _beh(b) for n, b in _decl_behaviors(cfg)}
+        if caps["tools"] == "sync":
+            assert all(v is None for v in behaviors.values())
+        elif caps["tools"] == "non_blocking":
+            assert behaviors and all(v == "NON_BLOCKING" for v in behaviors.values())
         else:
-            assert all(not b for b in behaviors)
+            assert behaviors["list_windows"] == "NON_BLOCKING"
+            assert behaviors["click"] == "BLOCKING"
 
 
 def test_live_config_maps_minimal_to_low():
@@ -221,7 +236,8 @@ def test_live_config_unknown_model_is_fast_shape():
     cfg = live.live_config(model="gemini-no-such-model", thinking="medium",
                            voice="Puck", known="", tool_decls=[{"name": "x"}])
     assert _thinking_name(cfg) is None
-    assert all(not b for _, b in _decl_behaviors(cfg))
+    # 3.8-live shape: either → NON_BLOCKING unless @tool(blocking=True)
+    assert all(_beh(b) == "NON_BLOCKING" for _, b in _decl_behaviors(cfg))
 
 
 def test_turn_is_complete_idle_vs_filler():
@@ -266,7 +282,7 @@ def test_receive_filler_then_idle_is_one_turn(tmp_path, monkeypatch):
     monkeypatch.setattr(live, "log", lambda entry: hist.write_text(
         json.dumps({**entry, "ts": "t"}) + "\n"))
     monkeypatch.setattr(live, "run_tools",
-                        lambda calls, registry=None: [
+                        lambda calls, registry=None, input_lock=None, skip_ids=None: [
                             {"result": {"ok": True}, "ms": 1, "ok": True}
                             for _ in calls])
     monkeypatch.setattr(live, "MUTE", tmp_path / "mute")
@@ -322,7 +338,7 @@ def test_cancelled_tool_ids_drop_results(tmp_path, monkeypatch):
     logged = []
     monkeypatch.setattr(live, "log", lambda entry: logged.append(entry))
     monkeypatch.setattr(live, "run_tools",
-                        lambda calls, registry=None: [
+                        lambda calls, registry=None, input_lock=None, skip_ids=None: [
                             {"result": {"ok": True}, "ms": 1, "ok": True}
                             for _ in calls])
     monkeypatch.setattr(live, "MUTE", tmp_path / "mute")
@@ -364,7 +380,7 @@ def test_cancelled_tool_ids_drop_results(tmp_path, monkeypatch):
 
     asyncio.run(go())
     assert sess.sent == []
-    assert logged and [a["tool"] for a in logged[0]["actions"]] == ["list_windows"]
+    assert logged and logged[0]["actions"] == []  # skipped, not run
 
 
 def test_save_settings_rejects_thinking_for_fast(tmp_path, monkeypatch):
@@ -381,3 +397,131 @@ def test_save_settings_rejects_thinking_for_fast(tmp_path, monkeypatch):
     ui.save_settings({"model": common.LIVE_FAST})  # key absent → clear leftover
     saved = json.loads(f.read_text())
     assert saved["thinking_level"] == ""
+
+
+def test_tool_response_puts_scheduling_in_payload_not_field():
+    call = SimpleNamespace(id="c1", name="list_windows")
+    row = {"result": {"ok": True}, "ok": True, "fn": tools.list_windows}
+    fr = live.tool_response(call, row)
+    assert fr.response["scheduling"] == "INTERRUPT"
+    assert getattr(fr, "scheduling", None) is None
+
+
+def test_scheduling_per_tool_interrupt_on_error():
+    assert live.scheduling_for(tools.list_windows, True) == "INTERRUPT"
+    assert live.scheduling_for(tools.click, True) == "SILENT"
+    assert live.scheduling_for(tools.click, False) == "INTERRUPT"
+    custom = SimpleNamespace(_beckon_scheduling="WHEN_IDLE")
+    assert live.scheduling_for(custom, True) == "WHEN_IDLE"
+    assert live.scheduling_for(custom, False) == "INTERRUPT"
+    assert live.scheduling_for(None, True) == "SILENT"
+
+
+def test_declarations_have_no_behavior():
+    for d in live.declarations(tools.BUILTIN_TOOLS):
+        assert "behavior" not in d
+
+
+def test_click_is_blocking_only_on_fast():
+    decls = [{"name": "click", "description": "c"},
+             {"name": "press_keybind", "description": "k"}]
+    fast = live.stamp_behavior(decls, common.LIVE_FAST)
+    ext = live.stamp_behavior(decls, common.LIVE_EXTENDED)
+    old = live.stamp_behavior(decls, common.LIVE_FAST, async_tools=False)
+    assert {d["name"]: d.get("behavior") for d in fast} == {
+        "click": "BLOCKING", "press_keybind": "BLOCKING"}
+    assert all(d.get("behavior") == "NON_BLOCKING" for d in ext)
+    assert all("behavior" not in d for d in old)
+
+
+def test_cancelled_still_runs_when_async_off(tmp_path, monkeypatch):
+    logged = []
+    monkeypatch.setattr(live, "log", lambda entry: logged.append(entry))
+    monkeypatch.setattr(live, "run_tools",
+                        lambda calls, registry=None, input_lock=None, skip_ids=None: [
+                            {"result": {"ok": True}, "ms": 1, "ok": True}
+                            for _ in calls])
+    monkeypatch.setattr(live, "MUTE", tmp_path / "mute")
+
+    class Sess:
+        def __init__(self):
+            self.sent = []
+
+        async def send_tool_response(self, function_responses):
+            self.sent.extend(function_responses)
+
+    def msg(said=None, complete=False, status=None, tool=None, cancel=None):
+        tc = None
+        if tool:
+            tc = SimpleNamespace(function_calls=[
+                SimpleNamespace(id="c1", name=tool, args={})])
+        sc = None
+        if said is not None:
+            sc = SimpleNamespace(
+                input_transcription=None,
+                output_transcription=SimpleNamespace(text=said),
+                turn_complete=complete, interaction_status=status, interrupted=None)
+        return SimpleNamespace(
+            server_content=sc, tool_call=tc,
+            tool_call_cancellation=SimpleNamespace(ids=cancel) if cancel else None,
+            usage_metadata=None, data=None)
+
+    sess = Sess()
+    L = live.Live(async_tools=False)
+
+    async def go():
+        await L.handle_message(sess, msg(cancel=["c1"]))
+        await L.handle_message(sess, msg(tool="list_windows"))
+        await L.handle_message(sess, msg("ok", True, "IDLE"))
+
+    asyncio.run(go())
+    assert sess.sent == []
+    assert logged and [a["tool"] for a in logged[0]["actions"]] == ["list_windows"]
+
+
+def test_input_tools_serialize_across_messages():
+    order, lock = [], threading.Lock()
+
+    def move_mouse(**kw):
+        order.append("move-start")
+        time.sleep(0.05)
+        order.append("move-end")
+        return "ok"
+
+    def click(**kw):
+        order.append("click")
+        return "ok"
+
+    def call(name):
+        return SimpleNamespace(id=name, name=name, args={})
+
+    def go(name):
+        live.run_tools([call(name)], registry={"move_mouse": move_mouse, "click": click},
+                       input_lock=lock)
+
+    t1 = threading.Thread(target=go, args=("move_mouse",))
+    t2 = threading.Thread(target=go, args=("click",))
+    t1.start()
+    time.sleep(0.01)
+    t2.start()
+    t1.join()
+    t2.join()
+    assert order == ["move-start", "move-end", "click"]
+
+
+def test_listen_indicator_off_starts_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(common, "SETTINGS_FILE", tmp_path / "settings.json")
+    (tmp_path / "settings.json").write_text(json.dumps({"listen_indicator": "false"}))
+    assert live.start_listen_indicator() is None
+    assert (Path(__file__).resolve().parents[1] / "beckon" / "listen.qml").is_file()
+
+
+def test_setting_on_false_not_overlaid(tmp_path, monkeypatch):
+    f = tmp_path / "settings.json"
+    monkeypatch.setattr(common, "SETTINGS_FILE", f)
+    f.write_text(json.dumps({"async_tools": False}))
+    assert common.setting_on("async_tools") is False
+    f.write_text(json.dumps({"async_tools": "false"}))
+    assert common.setting_on("async_tools") is False
+    f.write_text("{}")
+    assert common.setting_on("async_tools") is True

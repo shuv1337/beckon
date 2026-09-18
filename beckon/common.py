@@ -35,6 +35,8 @@ DEFAULTS = {
     "tts_model": "gemini-3.1-flash-tts-preview",   # tour narration
     "dev_url": "",     # tour's last stop; empty means the built-in default
     "dev_line": "",    # what the tour says over it
+    "async_tools": "true",  # Phase 2: task-per-tool_call; "false" restores inline await
+    "listen_indicator": "true",  # pulsing overlay while a Live session is up
 }
 
 # What each Live model accepts. live.py builds LiveConnectConfig from this;
@@ -172,6 +174,14 @@ def settings():
 def setting(key):
     """One setting; the default when it is unset or blank."""
     return settings().get(key) or DEFAULTS.get(key)
+
+
+def setting_on(key):
+    """True for 1/true/yes/on. A JSON false is not replaced by the default."""
+    v = settings().get(key, DEFAULTS.get(key))
+    if isinstance(v, bool):
+        return v
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def api_key():

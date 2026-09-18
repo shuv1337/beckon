@@ -39,6 +39,7 @@ fi
 
 cat > "$BIN/beckon" <<'LAUNCH'
 #!/bin/bash
+export PYTHONUNBUFFERED=1
 case "${1:-live}" in
   ui)   shift; exec python3 "$HOME/.local/share/beckon/ui.py" "$@" ;;
   live) shift; exec python3 "$HOME/.local/share/beckon/live.py" "$@" ;;

@@ -20,6 +20,21 @@ import memory
 DIRS = ("l", "r", "u", "d")
 
 
+def tool(*, blocking=False, scheduling="SILENT"):
+    """Mark a tool's Live API behavior and FunctionResponse scheduling.
+
+    blocking=True is honoured only on models that allow BLOCKING (3.8-live);
+    extended-thinking rejects BLOCKING so live_config stamps NON_BLOCKING.
+    scheduling is SILENT or INTERRUPT (WHEN_IDLE is for custom shell tools).
+    Errors always flip to INTERRUPT in live.scheduling_for.
+    """
+    def deco(fn):
+        fn._beckon_blocking = bool(blocking)
+        fn._beckon_scheduling = scheduling
+        return fn
+    return deco
+
+
 def _hypr(lua):
     r = subprocess.run(["hyprctl", "dispatch", lua],
                        capture_output=True, text=True, timeout=5)
@@ -41,6 +56,7 @@ def _lua_str(s):
 
 # --------------------------------------------------------------- reading state
 
+@tool(scheduling="INTERRUPT")
 def list_windows():
     """List every open window: app, title, workspace, monitor, address.
     Call this when the user names a window, so you can map their words to a
@@ -55,6 +71,7 @@ def list_windows():
     } for c in _query("clients")]
 
 
+@tool(scheduling="INTERRUPT")
 def current_window():
     """Get the window that currently has focus."""
     d = _query("activewindow")
@@ -66,6 +83,7 @@ def current_window():
             "floating": d.get("floating")}
 
 
+@tool(scheduling="INTERRUPT")
 def list_monitors():
     """List connected monitors: name, resolution, which is focused, and the
     workspace on each. Monitor 0 is usually the laptop, others are external."""
@@ -276,6 +294,7 @@ def _ydo_move(x, y):
     return _cursor()
 
 
+@tool(blocking=True)
 def move_mouse(x, y):
     """Move the mouse pointer to absolute screen coordinates. Screen origin is
     top-left of the leftmost monitor; check list_monitors for resolutions. Use
@@ -287,6 +306,7 @@ def move_mouse(x, y):
     return f"pointer at {cx},{cy}"
 
 
+@tool(blocking=True)
 def click(button="left"):
     """Click the mouse where the pointer currently is. Move it first with
     move_mouse. button: 'left', 'right', or 'middle'."""
@@ -302,6 +322,7 @@ def click(button="left"):
 
 # ------------------------------------------------------------------- clipboard
 
+@tool(scheduling="INTERRUPT")
 def read_clipboard():
     """Read what is currently on the clipboard. Use when the user says
     'what did I just copy' or wants you to act on copied text."""
@@ -342,6 +363,7 @@ def open_url(url):
 
 # ==================================================================== vision
 
+@tool(scheduling="INTERRUPT")
 def look_at_screen(question="What is on the screen?", mode="auto"):
     """LOOK at the screen and answer a question about what is visible.
 
@@ -491,6 +513,7 @@ def gather_windows(workspace=1):
     _hypr(f'hl.dsp.focus({{ workspace = "{ws}" }})')
     return {"moved": moved, "workspace": ws}
 
+@tool(blocking=True, scheduling="INTERRUPT")
 def find_on_screen(description):
     """Find something on the screen and return where to click it.
 
@@ -571,6 +594,7 @@ def _page_text(match="", timeout=15):
         return {"error": f"{type(e).__name__}: {str(e)[:100]}"}
 
 
+@tool(scheduling="INTERRUPT")
 def read_page_text(window=""):
     """Read the FULL text of what is open -- the whole email, article, document
     or chat, INCLUDING the parts scrolled off screen -- without scrolling.
@@ -663,6 +687,7 @@ def _match_keybind(name, rows):
         or next((b for b in rows if want.replace(" ", "") == b["chord"].lower().replace(" ", "")), None)
 
 
+@tool(scheduling="INTERRUPT")
 def list_keybinds(query=""):
     """Search the user's current keyboard shortcuts by what they do. Returns
     matching entries as 'chord -> name'. Use this to discover what the desktop
@@ -673,6 +698,7 @@ def list_keybinds(query=""):
     return [f"{b['chord']} -> {b['name']}" for b in rows[:40]] or ["no matches"]
 
 
+@tool(blocking=True)
 def press_keybind(name, force=False):
     """Trigger one of the user's keyboard shortcuts by its NAME (as shown by
     list_keybinds), e.g. 'Terminal', 'Browser', 'File manager', 'Screenshot',
@@ -720,6 +746,7 @@ def note(text):
     return memory.note(text)
 
 
+@tool(scheduling="INTERRUPT")
 def recall(query=""):
     """Look up saved preferences and notes. Pass a word to filter, or nothing
     for everything. Check this before asking the user which app or site they
@@ -821,6 +848,8 @@ def load_custom_tools():
             fn.__doc__ = desc
             fn.__signature__ = inspect.Signature(
                 [inspect.Parameter(a, inspect.Parameter.KEYWORD_ONLY) for a in args])
+            fn._beckon_blocking = False
+            fn._beckon_scheduling = "WHEN_IDLE"
             return fn
         out[name] = make(name, cmd, args, desc)
     return out

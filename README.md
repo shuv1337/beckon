@@ -21,6 +21,7 @@ itself:
 - **Typing** — type text, press keys, send shortcuts into the focused window
 - **Mouse** — move the pointer, click
 - **Vision** — screenshot the screen and answer questions about what's on it; a soft orange edge glow shows while it's looking
+- **Listening** — a small pulsing orange dot stays in the bottom-right while a session is up (the toast goes away; this doesn't)
 - **Reading** — pulls the *full text* of a page, email or document straight from the window, including everything scrolled off screen, so it answers without scrolling; it can use the text, the picture, or both ([setup](#reading-page-text))
 - **Keyboard shortcuts** — reads your *current* Omarchy keybindings live and can trigger any of them by name (terminal, browser, screenshot, emoji picker...); rebind a key and it follows
 - **Clipboard** — read and write
@@ -197,7 +198,9 @@ next session starts.
 
 **In Python** — add a function to `beckon/tools.py` and list it in `TOOLS` at
 the bottom. The docstring becomes the description, the signature becomes the
-schema; nothing else to register.
+schema; nothing else to register. Optional `@tool(blocking=True)` /
+`@tool(scheduling="INTERRUPT")` mark Live API behaviour; custom shell tools
+default to silent/`WHEN_IDLE`.
 
 ```python
 def lock_screen():
@@ -215,10 +218,11 @@ pre-commit hook in `.githooks/` that refuses to commit keys or local state; on
 a clone you didn't install from, run `git config core.hooksPath .githooks`.
 
 Changes to the prompt, tool schema or model settings should also be measured:
-`python3 evals/run.py` runs the spoken-command cases in `evals/cases.jsonl`
-against a real Live session with a fake desktop (needs your API key, costs a
-few cents), and `python3 evals/compare.py before.json after.json` shows what
-moved. Current numbers are in `evals/results/BASELINES.md`.
+`python3 evals/run.py` runs a cheap 16-case suite (one pass) against a real
+Live session with a fake desktop. `--suite full --repeat 3` is the old 79×3
+baseline and costs real money — don't run it by default.
+`python3 evals/compare.py before.json after.json` shows what moved. Current
+numbers are in `evals/results/BASELINES.md`.
 
 ## License
 

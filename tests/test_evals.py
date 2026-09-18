@@ -93,6 +93,16 @@ def test_cases_file_is_well_formed():
     assert len(cases) >= 60
 
 
+def test_cheap_suite_is_a_subset_of_cases():
+    from evals.run import CHEAP_IDS, load_cases
+    cheap = load_cases("", suite="cheap")
+    assert [c["id"] for c in cheap] == list(CHEAP_IDS)
+    full = load_cases("", suite="full")
+    assert set(CHEAP_IDS) <= {c["id"] for c in full}
+    assert len(full) >= 60
+    assert len(cheap) == 16
+
+
 def test_validate_case_reports_problems():
     assert score.validate_case({"id": "x"}) == ["missing cat", "missing say", "missing desktop",
                                                  "missing expect"]
