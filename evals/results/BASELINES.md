@@ -77,6 +77,65 @@ python3 evals/run.py --repeat 3 --tag baseline-text
 python3 evals/run.py --input audio --tag baseline-audio
 ```
 
+## Phase 1 — Gemini 3.8 Live
+
+Text-only gate, 79×3, same harness as Phase 0. HEAD was `2bcaa0b` with the
+uncommitted Phase 1 tree (`common`/`live`/`ui`/`evals`/`tests`); the `git`
+column is that HEAD. Default stays `gemini-3.8-live-extended-thinking` at
+`thinking_level=medium` — highest pass rate, and already `common.DEFAULTS`.
+
+| phase | git | live model | thinking | input | runs | pass | forbid | tool fails | timeouts | avg turn ms | avg reply words | tokens |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 default | 2bcaa0b* | gemini-3.8-live-extended-thinking | medium | text | 79×3 | 97% | 5 | 32 | 0 | 8593 | 12.6 | 5.85M |
+| 1 | 2bcaa0b* | gemini-3.8-live-extended-thinking | low | text | 79×3 | 96% | 2 | 7 | 0 | 8383 | 11.5 | 5.78M |
+| 1 | 2bcaa0b* | gemini-3.8-live-extended-thinking | high | text | 79×3 | 94% | 7 | 53 | 1 | 11061 | 14.6 | 5.19M |
+| 1 | 2bcaa0b* | gemini-3.8-live | – | text | 79×3 | 54% | 2 | 4 | 0 | 963 | 0.9 | 1.10M |
+
+`3.8-live` is not a candidate: 107 of 109 fails had an empty reply (avg 0.9
+words). It often fires one tool and closes on `turn_complete` before a spoken
+answer, so `reply_mentions_*` and multi-step recipes collapse. Fast, but it
+does not beat Phase 0.
+
+High is slower and worse than medium (more forbid, more tool fails, one
+timeout). Low is close on pass rate but drops `multi` (50%) and `tour` (78%);
+two of its ten fails were API 1011 "service unavailable", which still leaves
+it behind medium.
+
+Per-category, Phase 0 text vs Phase 1 default (medium):
+
+| category | n | p0 text | p1 medium |
+|---|---|---|---|
+| ambiguity | 15 | 93% | 100% |
+| clicking | 12 | 100% | 100% |
+| clipboard | 6 | 100% | 100% |
+| custom | 6 | 100% | 100% |
+| keybinds | 30 | 70% | 93% |
+| memory | 30 | 90% | 100% |
+| multi | 6 | 100% | 100% |
+| reading | 27 | 93% | 89% |
+| system | 18 | 100% | 100% |
+| tour | 9 | 100% | 100% |
+| typing | 24 | 75% | 96% |
+| windows | 36 | 86% | 100% |
+| workspaces | 18 | 100% | 100% |
+
+Phase 0's consistent misses are largely gone on medium (`win_close_editor`,
+`hotkey_paste`, `mem_email_then_remember`, `win_focus_editor` all 3/3).
+`kb_reboot_vague` is 2/3 (still one forbid). New consistent miss:
+
+- `look_colour` 0/3 — "what colour is the compose button" calls
+  `read_page_text` (forbidden; the case wants `look_at_screen`). That is the
+  whole reading dip.
+
+Commands:
+
+```
+python3 evals/run.py --model gemini-3.8-live --repeat 3 --tag phase1-38-live
+python3 evals/run.py --model gemini-3.8-live-extended-thinking --thinking medium --repeat 3 --tag phase1-38-ext-medium
+python3 evals/run.py --model gemini-3.8-live-extended-thinking --thinking high --repeat 3 --tag phase1-38-ext-high
+python3 evals/run.py --model gemini-3.8-live-extended-thinking --thinking low --repeat 3 --tag phase1-38-ext-low
+```
+
 ## Vision evals (`evals/vision.py`)
 
 Screenshots are captures of the maintainer's desktop and are not committed, so

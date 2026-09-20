@@ -40,6 +40,14 @@ MUTE = STATE / "mute"   # present while the tour narrates
 # the choices made in the panel also apply when the keybind starts a session.
 MODEL = os.environ.get("BECKON_LIVE_MODEL") or common.setting("model")
 VOICE = os.environ.get("BECKON_LIVE_VOICE") or common.setting("voice")
+# Blank env/setting is not "unset": required models still get a level via
+# resolved_thinking. Read settings.json directly -- setting() overlays DEFAULTS
+# and would always yield "medium". The panel sets BECKON_LIVE_THINKING on start.
+_THINKING_ENV = os.environ.get("BECKON_LIVE_THINKING")
+_THINKING_RAW = (_THINKING_ENV if _THINKING_ENV is not None
+                 else common.raw_setting("thinking_level"))
+THINKING = common.resolved_thinking(MODEL, _THINKING_RAW)
+_UNKNOWN_WARNED = set()
 # By default the mic is gated while the model speaks, so its own voice coming
 # back through the speakers can't be mistaken for you interrupting it. Set
 # BECKON_BARGE_IN=1 (headphones) to keep the mic open and allow talking over it.
@@ -194,14 +202,25 @@ def tool_ok(result):
     return not (isinstance(result, dict) and ("error" in result or "refused" in result))
 
 
-def live_config(voice=None, known=None, tool_decls=None):
+def live_config(voice=None, known=None, tool_decls=None, model=None,
+                thinking=None, non_blocking=None):
     """The LiveConnectConfig a real session uses. The eval harness calls this
     too, so what gets measured is exactly what gets shipped: same prompt, same
     tool schema, same VAD and transcription settings.
 
     voice/known/tool_decls default to the live session's values; the harness
     passes known="" so a run is not coloured by whatever is in memory.json.
+
+    thinking=None means "use the model's default" via resolved_thinking, so
+    evals do not inherit the user's settings.json. Live.run() passes
+    thinking=THINKING. Stamp behavior=NON_BLOCKING here, not on declarations().
     """
+    model = model or MODEL
+    caps = common.model_caps(model)
+    if model not in common.MODEL_CAPS and model not in _UNKNOWN_WARNED:
+        print(f"unknown live model {model!r}; treating as gemini-3.8-live",
+              file=sys.stderr)
+        _UNKNOWN_WARNED.add(model)
     try:   # be less trigger-happy about faint bleed-through counting as speech
         vad = types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
@@ -210,11 +229,15 @@ def live_config(voice=None, known=None, tool_decls=None):
         vad = None
     if known is None:
         known = memory.render()
-    return types.LiveConnectConfig(
+    decls = list(tool_decls if tool_decls is not None else declarations())
+    stamp = non_blocking if non_blocking is not None else (caps["tools"] == "non_blocking")
+    if stamp:
+        decls = [dict(d, behavior="NON_BLOCKING") for d in decls]
+    kwargs = dict(
         realtime_input_config=vad,
         response_modalities=["AUDIO"],
         system_instruction=SYSTEM + ("\n\n" + known if known else ""),
-        tools=[{"function_declarations": tool_decls if tool_decls is not None else declarations()}],
+        tools=[{"function_declarations": decls}],
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice or VOICE))),
@@ -224,6 +247,31 @@ def live_config(voice=None, known=None, tool_decls=None):
         context_window_compression=types.ContextWindowCompressionConfig(
             sliding_window=types.SlidingWindow()),
     )
+    if thinking is not None and common.thinking_was_mapped(model, thinking):
+        print(f"thinking_level 'minimal' is not accepted by {model}; using 'low'",
+              file=sys.stderr)
+    level = common.resolved_thinking(model, thinking)
+    if level:
+        kwargs["thinking_config"] = types.ThinkingConfig(
+            thinking_level=getattr(types.ThinkingLevel, level.upper()))
+    return types.LiveConnectConfig(**kwargs)
+
+
+def turn_is_complete(sc):
+    """True when this server_content closes the turn.
+
+    Models that emit interaction_status close on IDLE only -- a filler
+    turn_complete with IN_PROGRESS ("checking that…") is appended to said
+    but does not finish the turn. Models without the field close on
+    turn_complete, matching the 3.1 / 3.8-live shape.
+    """
+    if sc is None:
+        return False
+    status = getattr(sc, "interaction_status", None)
+    if status is not None:
+        name = str(getattr(status, "name", status))
+        return name.endswith("IDLE") and "UNSPECIFIED" not in name
+    return bool(getattr(sc, "turn_complete", None))
 
 
 def usage_dict(um):
@@ -250,6 +298,8 @@ def log(entry):
     entry["provider"] = PROVIDER
     entry["model"] = MODEL
     entry["voice"] = VOICE
+    if THINKING is not None:
+        entry["thinking_level"] = THINKING
     fd = os.open(HISTORY, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a") as f:
         f.write(json.dumps(entry) + "\n")
@@ -261,6 +311,7 @@ class Live:
         self.stop = asyncio.Event()
         self.out_q = asyncio.Queue()
         self.said, self.heard, self.actions = [], [], []
+        self.cancelled = set()     # tool_call_cancellation ids this turn
         self.last_played = 0.0
         self.turn_started = None   # first sign of the user's turn, for turn_ms
         self.usage = None          # last usage_metadata seen this turn
@@ -303,48 +354,62 @@ class Live:
         """Handle everything coming back: audio, transcripts, tool calls."""
         while not self.stop.is_set():
             async for msg in session.receive():
-                sc = getattr(msg, "server_content", None)
-                if self.turn_started is None and (sc or getattr(msg, "tool_call", None)):
-                    self.turn_started = time.monotonic()
-                um = getattr(msg, "usage_metadata", None)
-                if um:
-                    self.usage = usage_dict(um)
+                await self.handle_message(session, msg)
 
-                if getattr(msg, "data", None) and not MUTE.exists():
-                    self.last_played = time.monotonic()   # close the mic the moment audio arrives
-                    self.out_q.put_nowait(msg.data)   # dropped while the tour narrates
+    async def handle_message(self, session, msg):
+        """One LiveServerMessage. Extracted so tests can drive receive
+        without a real session.receive() loop."""
+        sc = getattr(msg, "server_content", None)
+        if self.turn_started is None and (sc or getattr(msg, "tool_call", None)):
+            self.turn_started = time.monotonic()
+        um = getattr(msg, "usage_metadata", None)
+        if um:
+            self.usage = usage_dict(um)
 
-                if sc:
-                    it = getattr(sc, "input_transcription", None)
-                    if it and getattr(it, "text", None):
-                        self.heard.append(it.text)
-                    ot = getattr(sc, "output_transcription", None)
-                    if ot and getattr(ot, "text", None):
-                        self.said.append(ot.text)
+        if getattr(msg, "data", None) and not MUTE.exists():
+            self.last_played = time.monotonic()   # close the mic the moment audio arrives
+            self.out_q.put_nowait(msg.data)   # dropped while the tour narrates
 
-                    if getattr(sc, "interrupted", None):
-                        # user talked over the model -- drop queued audio
-                        while not self.out_q.empty():
-                            self.out_q.get_nowait()
+        cancel = getattr(msg, "tool_call_cancellation", None)
+        if cancel and getattr(cancel, "ids", None):
+            self.cancelled.update(cancel.ids)
 
-                    if getattr(sc, "turn_complete", None):
-                        self.finish_turn()
-                        if self.once:
-                            self.stop.set()
+        if sc:
+            it = getattr(sc, "input_transcription", None)
+            if it and getattr(it, "text", None):
+                self.heard.append(it.text)
+            ot = getattr(sc, "output_transcription", None)
+            if ot and getattr(ot, "text", None):
+                self.said.append(ot.text)
 
-                tc = getattr(msg, "tool_call", None)
-                if tc and getattr(tc, "function_calls", None):
-                    calls = list(tc.function_calls)
-                    # Off the loop: a 45s screen read used to freeze mic, speaker
-                    # and the socket pump for its whole duration.
-                    results = await asyncio.to_thread(run_tools, calls)
-                    responses = []
-                    for call, r in zip(calls, results):
-                        self.actions.append({"tool": call.name, "args": dict(call.args or {}),
-                                             "ms": r["ms"], "ok": r["ok"]})
-                        responses.append(types.FunctionResponse(
-                            id=call.id, name=call.name, response={"result": r["result"]}))
-                    await session.send_tool_response(function_responses=responses)
+            if getattr(sc, "interrupted", None):
+                # user talked over the model -- drop queued audio
+                while not self.out_q.empty():
+                    self.out_q.get_nowait()
+
+            if turn_is_complete(sc):
+                self.finish_turn()
+                if self.once:
+                    self.stop.set()
+
+        tc = getattr(msg, "tool_call", None)
+        if tc and getattr(tc, "function_calls", None):
+            calls = list(tc.function_calls)
+            # Off the loop: a 45s screen read used to freeze mic, speaker
+            # and the socket pump for its whole duration.
+            results = await asyncio.to_thread(run_tools, calls)
+            responses = []
+            for call, r in zip(calls, results):
+                self.actions.append({"tool": call.name, "args": dict(call.args or {}),
+                                     "ms": r["ms"], "ok": r["ok"]})
+                # Cancelled ids drop results (no send). The side-effect already
+                # ran; Phase 2 will skip the call itself once tools are async.
+                if getattr(call, "id", None) in self.cancelled:
+                    continue
+                responses.append(types.FunctionResponse(
+                    id=call.id, name=call.name, response={"result": r["result"]}))
+            if responses:
+                await session.send_tool_response(function_responses=responses)
 
     def finish_turn(self):
         """Log one completed turn -- transcripts, tool calls with timings, token
@@ -362,6 +427,7 @@ class Live:
                           for a in self.actions)
             print(f"  you: {heard}\n  beckon: {said}{ran}")
         self.heard, self.said, self.actions = [], [], []
+        self.cancelled = set()
         self.turn_started, self.usage = None, None
 
     async def run(self):
@@ -372,12 +438,18 @@ class Live:
             return 1
 
         client = genai.Client(api_key=key)
-        config = live_config()
+        # THINKING is already resolved; warn here so a settings.json "minimal"
+        # still surfaces (live_config only warns on the raw value it is given).
+        if common.thinking_was_mapped(MODEL, _THINKING_RAW):
+            print(f"thinking_level 'minimal' is not accepted by {MODEL}; using 'low'",
+                  file=sys.stderr)
+        config = live_config(thinking=THINKING)
 
         PIDFILE.write_text(str(os.getpid()))
         MUTE.unlink(missing_ok=True)   # a cancelled tour must not leave us deaf
         notify("Listening — talk to me", "low")
-        print(f"Beckon live [{MODEL}, voice {VOICE}] — Ctrl+C to stop\n")
+        think = f", thinking {THINKING}" if THINKING else ""
+        print(f"Beckon live [{MODEL}{think}, voice {VOICE}] — Ctrl+C to stop\n")
 
         status = 0
         try:

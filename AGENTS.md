@@ -42,10 +42,23 @@ Independent project built for Omarchy users — not affiliated with Omarchy, Hyp
 ## How the pieces fit
 
 - **`common.py`** is the one leaf module: paths, `settings()`/`setting()`,
-  `api_key()`, `write_private()` (0600 + atomic), `generate_content()` (key in
-  the `x-goog-api-key` header, never the URL), `ydo()`, `browser()`, `notify()`.
+  `raw_setting()` (settings.json only — `setting()` overlays DEFAULTS and
+  would always yield `"medium"` for `thinking_level`), `api_key()`,
+  `write_private()` (0600 + atomic), `generate_content()` (key in the
+  `x-goog-api-key` header, never the URL), `ydo()`, `browser()`, `notify()`.
   Every model name lives in `common.DEFAULTS` and can be overridden from
   `settings.json`. Don't re-copy any of these into another file.
+- **`MODEL_CAPS`** in `common.py` is the table of what each Live model
+  accepts (`thinking` required/optional/omit, `thinking_levels`, `tools`
+  non_blocking/either/sync, `end_of_turn` idle/turn_complete). `live.live_config()`
+  builds `LiveConnectConfig` from it: stamps `behavior=NON_BLOCKING` on a
+  *copy* of the declarations when the cap says so (`non_blocking=None`
+  follows caps; `True` forces; `False` skips), and sends `thinking_config`
+  only when `resolved_thinking(model, thinking)` returns a level.
+  `thinking=None` means "use the model's default" so evals do not inherit
+  the user's `settings.json`. Unknown model names get the `gemini-3.8-live`
+  shape. `"minimal"` on a required-thinking model maps to `low` with a
+  warning. Don't put model names or thinking logic anywhere else.
 - **Tool schema** is generated from `tools.py` function signatures and
   docstrings. To add a tool: write a function, list it in `TOOLS` at the
   bottom of the file. Docstrings are what the model reads — keep them exact.
@@ -125,9 +138,13 @@ Independent project built for Omarchy users — not affiliated with Omarchy, Hyp
   `dev_line` the narration spoken over it. Both are settable from the panel and
   fall back to generic defaults, so nothing about one user's machine belongs in
   `tour.py`.
-- **Settings apply everywhere.** `live.py` reads `settings.json` for the model
-  and voice when the `BECKON_LIVE_*` env vars are unset, so a choice made in the
-  panel also applies when the keybind starts the session.
+- **Settings apply everywhere.** `live.py` reads `settings.json` for the model,
+  voice and `thinking_level` when the `BECKON_LIVE_*` env vars are unset, so a
+  choice made in the panel also applies when the keybind starts the session.
+  Session thinking comes from `raw_setting` / `BECKON_LIVE_THINKING`, not
+  `setting()` — an empty env/setting is not unset. The panel hides
+  `thinking_level` for models that omit it, and `/api/settings` rejects a
+  non-blank level for `gemini-3.8-live`.
 - **The tour restores the theme.** `tour._run` captures `omarchy theme current`
   before it starts and puts it back in `finally`, even if a step raised. It
   types into Claude only if Claude actually took focus, and never presses
@@ -139,10 +156,14 @@ Independent project built for Omarchy users — not affiliated with Omarchy, Hyp
   `/api/custom-tools` and register a shell command. Don't loosen this.
 - **Tests** live in `tests/`; run `pytest` from the repo root. They cover the
   schema builder, argument coercion, the dangerous-bind matcher, private file
-  writes, memory caps, settings parsing and custom-tool quoting. Nothing in
+  writes, memory caps, settings parsing, custom-tool quoting, `MODEL_CAPS`
+  config (`thinking_config` / `behavior`), filler-then-IDLE receive, and
+  settings rejecting `thinking_level` for `gemini-3.8-live`. Nothing in
   them touches Hyprland, audio or the network. `tests/test_evals.py` guards
   the eval harness the same way (fake schema == shipped schema, sandboxed
-  memory, scorer matchers, case file well-formed).
+  memory, scorer matchers, case file well-formed). `declarations()` must
+  stay byte-identical to `tools.BUILTIN_TOOLS` — stamp `behavior` only
+  inside `live_config()`, on a copy.
 - **Evals** live in `evals/` and DO use the network -- they are not part of
   `pytest`. `evals/run.py` opens one real Live session per case in
   `evals/cases.jsonl`, swaps `tools.TOOLS` for a `FakeDesktop` (answers from
@@ -157,9 +178,13 @@ Independent project built for Omarchy users — not affiliated with Omarchy, Hyp
   `live.live_config()`, and the `registry=` argument on `live.declarations`
   / `live.run_tools`. Keep them.
 - **History telemetry.** Each `history.jsonl` turn carries `session`,
-  `provider`, `model`, `voice`, `heard`, `reply`, `actions` (each with `tool`,
-  `args`, `ms`, `ok`), `turn_ms` and `usage` (`prompt`/`response`/`total`
-  tokens). The panel reads `actions` by that name -- don't rename it.
+  `provider`, `model`, `voice`, `thinking_level` (when the session sent one),
+  `heard`, `reply`, `actions` (each with `tool`, `args`, `ms`, `ok`),
+  `turn_ms` and `usage` (`prompt`/`response`/`total` tokens). The panel
+  reads `actions` by that name -- don't rename it. `receive()` closes a
+  turn on `IDLE` when `interaction_status` is present, else on
+  `turn_complete`. Cancelled tool ids still run (sync) and record the
+  action; the result is not sent.
 - **Pre-commit hook.** `install.sh` sets `core.hooksPath .githooks` on the
   clone it runs from; on any other clone run that `git config` by hand.
 

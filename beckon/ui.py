@@ -51,9 +51,20 @@ load_settings = common.settings
 
 def save_settings(new):
     """Merge known keys into settings.json. Every key in common.DEFAULTS is
-    settable here -- including dev_url/dev_line, which the README documents."""
+    settable here -- including dev_url/dev_line, which the README documents.
+
+    Switching to a model that omits thinking_config clears a stored level so
+    the next session does not inherit a leftover medium. A non-blank level
+    sent for such a model is kept so validate_live_pair can reject it.
+    """
     s = load_settings()
     s.update({k: str(v).strip() for k, v in new.items() if k in DEFAULTS and isinstance(v, (str, int, float))})
+    model = s.get("model") or ""
+    if common.model_caps(model)["thinking"] == "omit" and "thinking_level" not in new:
+        s["thinking_level"] = ""
+    err = common.validate_live_pair(model, s.get("thinking_level"))
+    if err:
+        raise ValueError(err)
     common.write_private(common.SETTINGS_FILE, json.dumps(s, indent=2))
     return s
 
@@ -135,6 +146,8 @@ class Handler(BaseHTTPRequestHandler):
                 "key": key_status(),
                 "settings": s,
                 "voices": list_voices(),
+                "models": common.live_models(),
+                "thinking_raw": common.raw_setting("thinking_level"),
                 "active_voice": s["voice"],
                 "live_running": live_running(),
                 "tools": [
@@ -187,7 +200,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"ok": True, "key": key_status()})
 
         if self.path == "/api/settings":
-            return self._send({"ok": True, "settings": save_settings(body)})
+            try:
+                return self._send({"ok": True, "settings": save_settings(body)})
+            except ValueError as e:
+                return self._send({"error": str(e)}, 400)
 
         if self.path == "/api/custom-tools":
             items = read_custom()
@@ -231,6 +247,11 @@ class Handler(BaseHTTPRequestHandler):
             # start still wins over a stale env in the panel's own process.
             st = load_settings()
             env = dict(os.environ, BECKON_LIVE_VOICE=st["voice"], BECKON_LIVE_MODEL=st["model"])
+            raw = common.raw_setting("thinking_level")
+            if raw is not None:
+                env["BECKON_LIVE_THINKING"] = str(raw)
+            else:
+                env.pop("BECKON_LIVE_THINKING", None)
             # live.py toggles: with a session running it stops it, otherwise it starts one
             if (action == "start") != live_running():
                 subprocess.Popen([sys.executable, str(HERE / "live.py")],

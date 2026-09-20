@@ -16,6 +16,7 @@ HANDOFF.md
 narration/
 *.wav
 *.log
+logs/
 
 # eval runs are local; only the curated baselines table is tracked.
 # vision screenshots are captures of YOUR desktop -- never committed.

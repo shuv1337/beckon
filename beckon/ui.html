@@ -178,7 +178,11 @@ input:focus,select:focus{border-color:var(--accent)}
     <label>Voice</label>
     <select id="voice"></select>
     <label>Model</label>
-    <select id="model"><option>gemini-3.1-flash-live-preview</option></select>
+    <select id="model" onchange="onModel()"></select>
+    <div id="thinkWrap" hidden>
+      <label>Thinking</label>
+      <select id="thinking"></select>
+    </div>
     <label>Tour: local dev server URL (optional)</label>
     <input id="devUrl" placeholder="http://localhost:3000" spellcheck="false">
     <label>Tour: what it says over it (optional)</label>
@@ -250,7 +254,8 @@ async function load(){
   const v=el('voice');v.innerHTML='';
   S.voices.forEach(x=>{const o=document.createElement('option');
     o.value=x.id;o.textContent=x.name;v.appendChild(o);});
-  v.value=S.settings.voice; el('model').value=S.settings.model;
+  v.value=S.settings.voice;
+  fillModels();
   if(document.activeElement!==el('devUrl')) el('devUrl').value=S.settings.dev_url||'';
   if(document.activeElement!==el('devLine')) el('devLine').value=S.settings.dev_line||'';
 
@@ -327,9 +332,44 @@ async function saveKey(){
   if(r.error) return toast(r.error,'err');
   el('key').value=''; toast('key saved','ok'); load();
 }
+function modelInfo(id){
+  return (S.models||[]).find(m=>m.id===id) || {id, label:id, thinking_levels:[]};
+}
+function fillModels(){
+  const m=el('model');
+  if(document.activeElement===m || document.activeElement===el('thinking')) return;
+  const cur=S.settings.model;
+  m.innerHTML='';
+  (S.models||[]).forEach(x=>{const o=document.createElement('option');
+    o.value=x.id;o.textContent=x.label;m.appendChild(o);});
+  if(cur && ![...m.options].some(o=>o.value===cur)){
+    const o=document.createElement('option'); o.value=cur; o.textContent=cur; m.appendChild(o);
+  }
+  m.value=cur;
+  fillThinking();
+}
+function fillThinking(){
+  const wrap=el('thinkWrap'), t=el('thinking');
+  const levels=modelInfo(el('model').value).thinking_levels||[];
+  wrap.hidden=!levels.length;
+  if(!levels.length){ t.innerHTML=''; return; }
+  if(document.activeElement===t) return;
+  const raw=S.thinking_raw==null?'':String(S.thinking_raw);
+  t.innerHTML='';
+  const off=document.createElement('option');
+  off.value=''; off.textContent='off (model default)'; t.appendChild(off);
+  levels.forEach(lv=>{const o=document.createElement('option');
+    o.value=lv;o.textContent=lv;t.appendChild(o);});
+  t.value=[...t.options].some(o=>o.value===raw)?raw:'';
+}
+function onModel(){ fillThinking(); }
 async function saveSettings(){
-  await api('/api/settings',{model:el('model').value,voice:el('voice').value,
+  const wrap=el('thinkWrap');
+  const thinking=wrap.hidden?'':el('thinking').value;
+  const r=await api('/api/settings',{model:el('model').value,voice:el('voice').value,
+    thinking_level:thinking,
     dev_url:el('devUrl').value.trim(),dev_line:el('devLine').value.trim()});
+  if(r.error) return toast(r.error,'err');
   toast('saved','ok'); load();
 }
 load(); setInterval(load,4000);
