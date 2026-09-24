@@ -397,6 +397,10 @@ def test_save_settings_rejects_thinking_for_fast(tmp_path, monkeypatch):
     ui.save_settings({"model": common.LIVE_FAST})  # key absent → clear leftover
     saved = json.loads(f.read_text())
     assert saved["thinking_level"] == ""
+    ui.save_settings({"listen_indicator": "false", "async_tools": "true"})
+    saved = json.loads(f.read_text())
+    assert saved["listen_indicator"] == "false"
+    assert saved["async_tools"] == "true"
 
 
 def test_tool_response_puts_scheduling_in_payload_not_field():

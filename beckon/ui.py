@@ -110,7 +110,7 @@ def key_status():
     }
 
 
-def recent_history(n=40):
+def recent_history(n=80):
     if not HISTORY.exists():
         return []
     lines = HISTORY.read_text().splitlines()[-n:]
