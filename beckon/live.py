@@ -14,7 +14,9 @@ import inspect
 import json
 import os
 import signal
+import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -22,6 +24,11 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
+try:   # F8 starts us without a TTY; don't lose crash lines to block buffering
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 import common  # noqa: E402
 import tools   # noqa: E402
 import memory  # noqa: E402
@@ -35,6 +42,12 @@ STATE = common.STATE
 STATE.mkdir(parents=True, exist_ok=True)
 PIDFILE = STATE / "live.pid"
 MUTE = STATE / "mute"   # present while the tour narrates
+
+# Input tools share a per-session lock so overlapping NON_BLOCKING messages
+# cannot race click-recipe order (find → move → click) on extended-thinking.
+INPUT_TOOLS = frozenset({
+    "move_mouse", "click", "type_text", "press_key", "hotkey", "press_keybind",
+})
 
 # Environment wins (the panel's start button sets it), then settings.json, so
 # the choices made in the panel also apply when the keybind starts a session.
@@ -179,21 +192,38 @@ def coerce_args(fn, args):
     return out
 
 
-def run_tools(calls, registry=None):
+def run_tools(calls, registry=None, input_lock=None, skip_ids=None):
     """Execute one tool_call message's functions in order, off the event loop.
     Order matters (find_on_screen -> move_mouse -> click), so they run
-    sequentially in a single worker thread."""
+    sequentially in a single worker thread. skip_ids are cancelled before
+    start and yield None. Input tools take input_lock so overlapping
+    messages cannot interleave a click recipe."""
     reg = registry if registry is not None else tools.TOOLS
+    skip_ids = skip_ids or set()
     results = []
     for call in calls:
+        cid = getattr(call, "id", None)
+        if cid in skip_ids:
+            results.append(None)
+            continue
         fn = reg.get(call.name)
+        lock = input_lock if (input_lock is not None and call.name in INPUT_TOOLS) else None
         t0 = time.monotonic()
         try:
-            result = fn(**coerce_args(fn, call.args)) if fn else {"error": "unknown tool"}
+            if lock:
+                lock.acquire()
+            try:
+                if cid in skip_ids:
+                    results.append(None)
+                    continue
+                result = fn(**coerce_args(fn, call.args)) if fn else {"error": "unknown tool"}
+            finally:
+                if lock:
+                    lock.release()
         except Exception as e:
             result = {"error": f"{type(e).__name__}: {e}"}
         results.append({"result": result, "ms": int((time.monotonic() - t0) * 1000),
-                        "ok": tool_ok(result)})
+                        "ok": tool_ok(result), "fn": fn})
     return results
 
 
@@ -202,8 +232,55 @@ def tool_ok(result):
     return not (isinstance(result, dict) and ("error" in result or "refused" in result))
 
 
+def scheduling_for(fn, ok):
+    """FunctionResponse scheduling. Errors always INTERRUPT so the model reports them."""
+    if not ok:
+        return "INTERRUPT"
+    raw = getattr(fn, "_beckon_scheduling", None) or "SILENT"
+    if raw not in ("SILENT", "INTERRUPT", "WHEN_IDLE"):
+        raw = "SILENT"
+    return raw
+
+
+def tool_response(call, row, fn=None):
+    """One FunctionResponse. Scheduling lives in the payload — the SDK field
+    is rejected by current Live models ('not supported for this model')."""
+    fn = fn if fn is not None else row.get("fn")
+    sched = scheduling_for(fn, row["ok"])
+    return types.FunctionResponse(
+        id=getattr(call, "id", None), name=call.name,
+        response={"result": row["result"], "scheduling": sched})
+
+
+def stamp_behavior(decls, model, non_blocking=None, registry=None, async_tools=True):
+    """Copy declarations and stamp Behavior per MODEL_CAPS + @tool(blocking).
+
+    non_blocking=None follows caps (and per-tool BLOCKING on 'either');
+    True forces NON_BLOCKING on every decl; False leaves them unstamped.
+    async_tools=False restores the Phase 1 stamp (blanket NON_BLOCKING on
+    extended-thinking only).
+    """
+    caps = common.model_caps(model)
+    if not async_tools:
+        if non_blocking is False or (non_blocking is None and caps["tools"] != "non_blocking"):
+            return [dict(d) for d in decls]
+        return [dict(d, behavior="NON_BLOCKING") for d in decls]
+    if non_blocking is False or caps["tools"] == "sync":
+        return [dict(d) for d in decls]
+    if non_blocking is True or caps["tools"] == "non_blocking":
+        return [dict(d, behavior="NON_BLOCKING") for d in decls]
+    # 'either': default NON_BLOCKING; BLOCKING allowed for @tool(blocking=True)
+    reg = registry if registry is not None else tools.TOOLS
+    out = []
+    for d in decls:
+        fn = reg.get(d["name"]) if isinstance(d, dict) else None
+        blocking = bool(getattr(fn, "_beckon_blocking", False))
+        out.append(dict(d, behavior="BLOCKING" if blocking else "NON_BLOCKING"))
+    return out
+
+
 def live_config(voice=None, known=None, tool_decls=None, model=None,
-                thinking=None, non_blocking=None):
+                thinking=None, non_blocking=None, registry=None, async_tools=True):
     """The LiveConnectConfig a real session uses. The eval harness calls this
     too, so what gets measured is exactly what gets shipped: same prompt, same
     tool schema, same VAD and transcription settings.
@@ -213,7 +290,8 @@ def live_config(voice=None, known=None, tool_decls=None, model=None,
 
     thinking=None means "use the model's default" via resolved_thinking, so
     evals do not inherit the user's settings.json. Live.run() passes
-    thinking=THINKING. Stamp behavior=NON_BLOCKING here, not on declarations().
+    thinking=THINKING. Stamp behavior here, not on declarations() — per-tool
+    BLOCKING on 3.8-live, all NON_BLOCKING on extended-thinking.
     """
     model = model or MODEL
     caps = common.model_caps(model)
@@ -229,10 +307,9 @@ def live_config(voice=None, known=None, tool_decls=None, model=None,
         vad = None
     if known is None:
         known = memory.render()
-    decls = list(tool_decls if tool_decls is not None else declarations())
-    stamp = non_blocking if non_blocking is not None else (caps["tools"] == "non_blocking")
-    if stamp:
-        decls = [dict(d, behavior="NON_BLOCKING") for d in decls]
+    decls = stamp_behavior(
+        list(tool_decls if tool_decls is not None else declarations()),
+        model, non_blocking=non_blocking, registry=registry, async_tools=async_tools)
     kwargs = dict(
         realtime_input_config=vad,
         response_modalities=["AUDIO"],
@@ -306,12 +383,19 @@ def log(entry):
 
 
 class Live:
-    def __init__(self, once=False):
+    def __init__(self, once=False, async_tools=None, registry=None):
         self.once = once
+        # None → Phase 2 on (evals/tests do not inherit settings.json).
+        # Live.run() passes the user's setting.
+        self.async_tools = True if async_tools is None else bool(async_tools)
+        self.registry = registry
         self.stop = asyncio.Event()
         self.out_q = asyncio.Queue()
         self.said, self.heard, self.actions = [], [], []
         self.cancelled = set()     # tool_call_cancellation ids this turn
+        self.tool_tasks = {}       # call id → Task
+        self._running = set()      # in-flight run_tool_message tasks
+        self.input_lock = threading.Lock()
         self.last_played = 0.0
         self.turn_started = None   # first sign of the user's turn, for turn_ms
         self.usage = None          # last usage_metadata seen this turn
@@ -373,6 +457,13 @@ class Live:
         cancel = getattr(msg, "tool_call_cancellation", None)
         if cancel and getattr(cancel, "ids", None):
             self.cancelled.update(cancel.ids)
+            if self.async_tools:
+                seen = set()
+                for cid in cancel.ids:
+                    t = self.tool_tasks.get(cid)
+                    if t is not None and t not in seen and not t.done():
+                        t.cancel()
+                        seen.add(t)
 
         if sc:
             it = getattr(sc, "input_transcription", None)
@@ -387,29 +478,58 @@ class Live:
                 while not self.out_q.empty():
                     self.out_q.get_nowait()
 
-            if turn_is_complete(sc):
-                self.finish_turn()
-                if self.once:
-                    self.stop.set()
-
+        # Tools before turn-complete so an IDLE in the same message still
+        # records the call, and so cancellation can land while a slow tool runs.
         tc = getattr(msg, "tool_call", None)
         if tc and getattr(tc, "function_calls", None):
             calls = list(tc.function_calls)
-            # Off the loop: a 45s screen read used to freeze mic, speaker
-            # and the socket pump for its whole duration.
-            results = await asyncio.to_thread(run_tools, calls)
-            responses = []
-            for call, r in zip(calls, results):
-                self.actions.append({"tool": call.name, "args": dict(call.args or {}),
-                                     "ms": r["ms"], "ok": r["ok"]})
-                # Cancelled ids drop results (no send). The side-effect already
-                # ran; Phase 2 will skip the call itself once tools are async.
-                if getattr(call, "id", None) in self.cancelled:
-                    continue
-                responses.append(types.FunctionResponse(
-                    id=call.id, name=call.name, response={"result": r["result"]}))
-            if responses:
-                await session.send_tool_response(function_responses=responses)
+            task = asyncio.create_task(self.run_tool_message(session, calls))
+            self._running.add(task)
+            task.add_done_callback(self._running.discard)
+            for call in calls:
+                cid = getattr(call, "id", None)
+                if cid is not None:
+                    self.tool_tasks[cid] = task
+            if not self.async_tools:
+                await task
+
+        if sc and turn_is_complete(sc):
+            await self.drain_tools()
+            self.finish_turn()
+            if self.once:
+                self.stop.set()
+
+    async def drain_tools(self):
+        """Wait for in-flight tool tasks. Used at turn end so history is complete."""
+        running = [t for t in self._running if not t.done()]
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
+
+    async def run_tool_message(self, session, calls):
+        """One tool_call message: sequential worker, then send uncancelled results."""
+        if self.async_tools:
+            pending = [c for c in calls if getattr(c, "id", None) not in self.cancelled]
+        else:
+            pending = list(calls)
+        if not pending:
+            return
+        try:
+            results = await asyncio.to_thread(
+                run_tools, pending, self.registry, self.input_lock,
+                self.cancelled if self.async_tools else None)
+        except asyncio.CancelledError:
+            return
+        responses = []
+        for call, r in zip(pending, results):
+            if r is None:
+                continue
+            self.actions.append({"tool": call.name, "args": dict(call.args or {}),
+                                 "ms": r["ms"], "ok": r["ok"]})
+            if getattr(call, "id", None) in self.cancelled:
+                continue
+            responses.append(tool_response(call, r))
+        if responses:
+            await session.send_tool_response(function_responses=responses)
 
     def finish_turn(self):
         """Log one completed turn -- transcripts, tool calls with timings, token
@@ -428,6 +548,7 @@ class Live:
             print(f"  you: {heard}\n  beckon: {said}{ran}")
         self.heard, self.said, self.actions = [], [], []
         self.cancelled = set()
+        self.tool_tasks = {}
         self.turn_started, self.usage = None, None
 
     async def run(self):
@@ -443,13 +564,14 @@ class Live:
         if common.thinking_was_mapped(MODEL, _THINKING_RAW):
             print(f"thinking_level 'minimal' is not accepted by {MODEL}; using 'low'",
                   file=sys.stderr)
-        config = live_config(thinking=THINKING)
+        config = live_config(thinking=THINKING, async_tools=self.async_tools)
 
         PIDFILE.write_text(str(os.getpid()))
         MUTE.unlink(missing_ok=True)   # a cancelled tour must not leave us deaf
         notify("Listening — talk to me", "low")
         think = f", thinking {THINKING}" if THINKING else ""
         print(f"Beckon live [{MODEL}{think}, voice {VOICE}] — Ctrl+C to stop\n")
+        indicator = None if self.once else start_listen_indicator()
 
         status = 0
         try:
@@ -468,10 +590,38 @@ class Live:
             print("error:", msg, file=sys.stderr)
             status = 1
         finally:
+            stop_listen_indicator(indicator)
             PIDFILE.unlink(missing_ok=True)
             MUTE.unlink(missing_ok=True)
             notify("Session ended", "low")
         return status
+
+
+def start_listen_indicator():
+    """Click-through pulsing dot while the session is up. None if disabled
+    or Quickshell isn't installed. live.py owns the process lifetime."""
+    import shutil
+    if not common.setting_on("listen_indicator"):
+        return None
+    qml = HERE / "listen.qml"
+    if not shutil.which("quickshell") or not qml.exists():
+        return None
+    return subprocess.Popen(["quickshell", "-p", str(qml)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stop_listen_indicator(proc):
+    if proc is None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        proc.kill()
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
 
 
 def is_live_pid(pid):
@@ -500,7 +650,7 @@ def main():
         except (ValueError, ProcessLookupError):
             PIDFILE.unlink(missing_ok=True)
 
-    live = Live(once=once)
+    live = Live(once=once, async_tools=common.setting_on("async_tools"))
 
     def bye(*_):
         live.stop.set()

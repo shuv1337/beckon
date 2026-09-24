@@ -1,14 +1,15 @@
 """Run evals/cases.jsonl against a real Live session with a fake desktop.
 
-    python3 evals/run.py                         # current defaults, text input
-    python3 evals/run.py --input audio           # TTS the utterance, stream it
-    python3 evals/run.py --cases 'mem_*,kb_*' --repeat 3
-    python3 evals/run.py --model gemini-3.8-live --thinking low --non-blocking
+    python3 evals/run.py                         # cheap suite, 1×, text
+    python3 evals/run.py --suite full            # all 79 cases, still 1×
+    python3 evals/run.py --suite full --repeat 3 # Phase 0 style; expensive
+    python3 evals/run.py --cases 'mem_*,kb_*'
+    python3 evals/run.py --model gemini-3.8-live --thinking low
 
-Each case opens a fresh session (clean context), sends the utterance, answers
-tool calls from the FakeDesktop, and records the transcript, calls, timing and
-token usage. Results land in evals/results/<stamp>-<tag>.json; compare two
-runs with evals/compare.py. Network is required; this is not part of pytest.
+Default is `--suite cheap` (16 high-signal cases, one pass). Each case opens
+a fresh Live session and costs real tokens — do not pass `--suite full
+--repeat 3` unless you mean to. Results land in evals/results/<stamp>-<tag>.json.
+Network is required; this is not part of pytest.
 """
 import argparse
 import asyncio
@@ -37,6 +38,20 @@ from evals import score as scoring                     # noqa: E402
 
 CASES = ROOT / "evals" / "cases.jsonl"
 RESULTS = ROOT / "evals" / "results"
+# Default gate: one case per failure class, plus the click recipe. ~1/15 the
+# tokens of a 79×3 extended-thinking run. --suite full --repeat 3 is opt-in.
+CHEAP_IDS = (
+    "win_side_by_side", "win_close_editor",
+    "click_first_email", "click_compose",
+    "multi_open_and_read",
+    "kb_reboot_vague", "kb_lock_explicit", "kb_done_for_day",
+    "hotkey_paste",
+    "look_colour", "read_email",
+    "mem_email_unknown", "mem_email_known",
+    "amb_thanks",
+    "sys_volume_50",
+    "tour_not_for_help",
+)
 AUDIO_CACHE = Path.home() / ".cache" / "beckon" / "eval"
 USER_VOICE = "Charon"          # distinct from the assistant's voice
 PCM_RATE = 24000               # narrate.generate output; Live resamples for us
@@ -50,12 +65,20 @@ TTS_FRAMES = ("Read this aloud in a casual voice, exactly as written: ",
               "Speak this, word for word: ")
 
 
-def load_cases(patterns):
+def load_cases(patterns, suite="cheap"):
     cases = [json.loads(l) for l in CASES.read_text().splitlines() if l.strip()]
     if patterns:
         pats = [p.strip() for p in patterns.split(",") if p.strip()]
         cases = [c for c in cases
                  if any(fnmatch.fnmatch(c["id"], p) or fnmatch.fnmatch(c["cat"], p) for p in pats)]
+    elif suite == "cheap":
+        want = set(CHEAP_IDS)
+        cases = [c for c in cases if c["id"] in want]
+        missing = want - {c["id"] for c in cases}
+        if missing:
+            sys.exit(f"cheap suite ids missing from cases.jsonl: {sorted(missing)}")
+        order = {i: n for n, i in enumerate(CHEAP_IDS)}
+        cases.sort(key=lambda c: order[c["id"]])
     return cases
 
 
@@ -202,8 +225,7 @@ async def one_turn(session, fd, opt):
                     calls.append({"tool": call.name, "args": dict(call.args or {}),
                                   "ms": r["ms"], "ok": r["ok"],
                                   "result": json.dumps(r["result"], default=str)[:300]})
-                    responses.append(types.FunctionResponse(
-                        id=call.id, name=call.name, response={"result": r["result"]}))
+                    responses.append(live.tool_response(call, r))
                 await session.send_tool_response(function_responses=responses)
                 last_tool = time.monotonic()
 
@@ -310,9 +332,18 @@ async def main_async(opt):
     key = common.api_key()
     if not key:
         sys.exit("no API key (~/.config/beckon/api_key)")
-    cases = load_cases(opt.cases)
+    cases = load_cases(opt.cases, suite=opt.suite)
     if not cases:
         sys.exit("no cases matched")
+    n = len(cases) * opt.repeat
+    print(f"eval {opt.suite if not opt.cases else 'cases=' + opt.cases}: "
+          f"{len(cases)} cases × {opt.repeat} = {n} Live sessions  "
+          f"[{opt.model}"
+          + (f" thinking={opt.thinking}" if opt.thinking else "")
+          + f" {opt.input}]", flush=True)
+    if n > 20:
+        print(f"note: that is the expensive path; default is --suite cheap ({len(CHEAP_IDS)}×1)",
+              file=sys.stderr, flush=True)
     fixtures = {p.stem for p in FIXTURES.glob("*.json")}
     for c in cases:
         bad = scoring.validate_case(c, fixtures, set(FakeDesktop(c["desktop"]).tools))
@@ -337,7 +368,8 @@ async def main_async(opt):
     out.write_text(json.dumps({
         "meta": {"provider": opt.provider, "model": opt.model, "voice": opt.voice,
                  "thinking": opt.thinking, "non_blocking": opt.non_blocking, "input": opt.input,
-                 "repeat": opt.repeat, "cases": opt.cases, "stamp": stamp, "git": git_rev(),
+                 "repeat": opt.repeat, "cases": opt.cases, "suite": opt.suite,
+                  "stamp": stamp, "git": git_rev(),
                  "text_model": common.setting("text_model")},
         "summary": summary, "rows": rows}, indent=1, default=str))
     print_table(rows, summary)
@@ -356,8 +388,11 @@ def main():
     ap.add_argument("--non-blocking", action="store_true",
                     help="declare tools NON_BLOCKING (required by *-extended-thinking)")
     ap.add_argument("--input", default="text", choices=["text", "audio"])
-    ap.add_argument("--cases", default="", help="comma-separated globs on id or cat")
-    ap.add_argument("--repeat", type=int, default=1)
+    ap.add_argument("--cases", default="", help="comma-separated globs on id or cat; overrides --suite")
+    ap.add_argument("--suite", default="cheap", choices=["cheap", "full"],
+                    help="cheap = 16 high-signal cases (default); full = all of cases.jsonl")
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="passes over the suite (default 1; 3 is the old baseline and expensive)")
     ap.add_argument("--timeout", type=float, default=60, help="seconds per turn")
     ap.add_argument("--settle", type=float, default=6, help="seconds to wait for a post-tool reply")
     ap.add_argument("--gap", type=float, default=0.5, help="seconds between sessions")

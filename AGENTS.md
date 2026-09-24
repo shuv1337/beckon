@@ -51,10 +51,12 @@ Independent project built for Omarchy users — not affiliated with Omarchy, Hyp
 - **`MODEL_CAPS`** in `common.py` is the table of what each Live model
   accepts (`thinking` required/optional/omit, `thinking_levels`, `tools`
   non_blocking/either/sync, `end_of_turn` idle/turn_complete). `live.live_config()`
-  builds `LiveConnectConfig` from it: stamps `behavior=NON_BLOCKING` on a
-  *copy* of the declarations when the cap says so (`non_blocking=None`
-  follows caps; `True` forces; `False` skips), and sends `thinking_config`
-  only when `resolved_thinking(model, thinking)` returns a level.
+  builds `LiveConnectConfig` from it: stamps `behavior` on a *copy* of the
+  declarations (`non_blocking=None` follows caps; `True` forces NON_BLOCKING;
+  `False` skips). On `gemini-3.8-live`, `@tool(blocking=True)` tools
+  (`find_on_screen`, `move_mouse`, `click`, `press_keybind`) are BLOCKING;
+  extended-thinking stamps NON_BLOCKING on every tool. `thinking_config` is
+  sent only when `resolved_thinking(model, thinking)` returns a level.
   `thinking=None` means "use the model's default" so evals do not inherit
   the user's `settings.json`. Unknown model names get the `gemini-3.8-live`
   shape. `"minimal"` on a required-thinking model maps to `low` with a
@@ -64,9 +66,14 @@ Independent project built for Omarchy users — not affiliated with Omarchy, Hyp
   bottom of the file. Docstrings are what the model reads — keep them exact.
   Parameter types come from the default value: `False` → BOOLEAN, `0` →
   INTEGER, `""` → STRING. `live.coerce_args` also casts what the model sends,
-  so a string `"false"` for `force=` can never read as True. Tool calls run
-  in a worker thread (`live.run_tools`), sequentially, so a slow screen read
-  never freezes the mic or speaker.
+  so a string `"false"` for `force=` can never read as True. `@tool` in
+  `tools.py` sets `blocking` and FunctionResponse `scheduling` (INTERRUPT
+  for reads/lists, SILENT for actions, WHEN_IDLE for custom shell tools);
+  errors always INTERRUPT. `receive()` spawns a task per `tool_call`
+  message (`async_tools`, default on; `"false"` restores inline await).
+  Calls in one message still run sequentially in one worker; a per-session
+  lock serialises input tools across messages. Cancelled ids skip
+  execution and drop the send.
 - **Shell tools** live in `~/.config/beckon/custom_tools.json` and are loaded
   by `load_custom_tools()` at import. `{arg}` placeholders are shell-quoted.
 - **Hyprland calls** use the Lua dispatcher API via `hyprctl dispatch 'hl.dsp…'`.
@@ -95,6 +102,11 @@ Independent project built for Omarchy users — not affiliated with Omarchy, Hyp
 - **Edge glow** is `glow.qml`, a click-through Quickshell overlay started by
   `tools._start_pulse()` during screen reads. Quickshell ships with Omarchy;
   without it the code falls back to pulsing the focused window's border.
+  **Listening indicator** is `listen.qml`, a small pulsing dot in the
+  bottom-right of every screen for the whole Live session. `live.py` starts
+  and kills it; `listen_indicator=false` in settings.json turns it off.
+  There is no tray icon — Omarchy's tray is StatusNotifierItem, and Beckon
+  does not ship one.
 - **Keybinds** are read live from `omarchy menu keybindings --print` each call
   (`tools._keybinds()`), never stored. `press_keybind` sends the real chord via
   ydotool because Hyprland's `send_key_state` does NOT fire binds (verified).
@@ -144,7 +156,8 @@ Independent project built for Omarchy users — not affiliated with Omarchy, Hyp
   Session thinking comes from `raw_setting` / `BECKON_LIVE_THINKING`, not
   `setting()` — an empty env/setting is not unset. The panel hides
   `thinking_level` for models that omit it, and `/api/settings` rejects a
-  non-blank level for `gemini-3.8-live`.
+  non-blank level for `gemini-3.8-live`. `async_tools` (default `"true"`)
+  is the Phase 2 receive path; `"false"` restores Phase 1 inline await.
 - **The tour restores the theme.** `tour._run` captures `omarchy theme current`
   before it starts and puts it back in `finally`, even if a step raised. It
   types into Claude only if Claude actually took focus, and never presses
@@ -157,22 +170,26 @@ Independent project built for Omarchy users — not affiliated with Omarchy, Hyp
 - **Tests** live in `tests/`; run `pytest` from the repo root. They cover the
   schema builder, argument coercion, the dangerous-bind matcher, private file
   writes, memory caps, settings parsing, custom-tool quoting, `MODEL_CAPS`
-  config (`thinking_config` / `behavior`), filler-then-IDLE receive, and
-  settings rejecting `thinking_level` for `gemini-3.8-live`. Nothing in
+  config (`thinking_config` / `behavior`), filler-then-IDLE receive,
+  settings rejecting `thinking_level` for `gemini-3.8-live`, per-tool
+  scheduling, cancelled-skip, and input-tool serialisation. Nothing in
   them touches Hyprland, audio or the network. `tests/test_evals.py` guards
   the eval harness the same way (fake schema == shipped schema, sandboxed
   memory, scorer matchers, case file well-formed). `declarations()` must
   stay byte-identical to `tools.BUILTIN_TOOLS` — stamp `behavior` only
   inside `live_config()`, on a copy.
 - **Evals** live in `evals/` and DO use the network -- they are not part of
-  `pytest`. `evals/run.py` opens one real Live session per case in
-  `evals/cases.jsonl`, swaps `tools.TOOLS` for a `FakeDesktop` (answers from
-  `evals/fixtures/desktops/*.json`, records every call), sends the utterance
-  as text (`--input audio` streams a TTS rendering instead), and scores with
-  `evals/score.py`. `evals/compare.py A.json B.json` diffs two runs.
-  `evals/vision.py` scores `find_on_screen`/`look_at_screen` prompts on local
-  screenshots (never committed). Every behaviour change in `PLAN.md` is gated
-  on these; record baselines in `evals/results/BASELINES.md`. Seams that exist
+  `pytest`. Default is `--suite cheap` (16 high-signal cases, `--repeat 1`).
+  `--suite full --repeat 3` is the old 79×3 baseline and is expensive; do
+  not run it unless asked. `evals/run.py` opens one real Live session per
+  case in `evals/cases.jsonl`, swaps `tools.TOOLS` for a `FakeDesktop`
+  (answers from `evals/fixtures/desktops/*.json`, records every call), sends
+  the utterance as text (`--input audio` streams a TTS rendering instead),
+  and scores with `evals/score.py`. `evals/compare.py A.json B.json` diffs
+  two runs. `evals/vision.py` scores `find_on_screen`/`look_at_screen`
+  prompts on local screenshots (never committed). Phase gates use cheap;
+  record full-suite rows in `evals/results/BASELINES.md` only when a
+  rebaseline is requested. Seams that exist
   only for the harness: `tools.BUILTIN_TOOLS`, `tools._parse_keybinds`,
   `tools._match_keybind`, `tools._locate`, `tools._ask_vision`,
   `live.live_config()`, and the `registry=` argument on `live.declarations`
@@ -183,8 +200,9 @@ Independent project built for Omarchy users — not affiliated with Omarchy, Hyp
   `turn_ms` and `usage` (`prompt`/`response`/`total` tokens). The panel
   reads `actions` by that name -- don't rename it. `receive()` closes a
   turn on `IDLE` when `interaction_status` is present, else on
-  `turn_complete`. Cancelled tool ids still run (sync) and record the
-  action; the result is not sent.
+  `turn_complete`. With `async_tools` on, cancelled ids skip execution
+  and the result is not sent; with it off they still run (sync), record
+  the action, and drop the send.
 - **Pre-commit hook.** `install.sh` sets `core.hooksPath .githooks` on the
   clone it runs from; on any other clone run that `git config` by hand.
 

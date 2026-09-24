@@ -83,7 +83,8 @@ system, custom tools, destructive-refusal (close all, lock), tour trigger vs
 
 ### 0.3 Runner — `evals/run.py`
 
-- `--provider gemini|openai|codex --model M --thinking L --repeat N --cases glob`
+- `--provider gemini|openai|codex --model M --thinking L --repeat N --cases glob --suite cheap|full`
+  Default `--suite cheap` (16 cases × 1). Full 79×3 is opt-in and expensive.
 - Replaces `tools.TOOLS` with a `FakeDesktop` that answers from the fixture,
   records calls, and returns plausible results (never touches Hyprland).
 - Input modes:

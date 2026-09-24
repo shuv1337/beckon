@@ -103,6 +103,9 @@ input:focus,select:focus{border-color:var(--accent)}
 .ct:last-child{border:0} .ct b{font:500 12px var(--mono);color:var(--accent)}
 .ct code{font:400 11.5px var(--mono);color:var(--faint);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hint{font:400 11.5px/1.55 var(--sans);color:var(--faint);margin-top:11px}
+.tog{display:flex;align-items:center;gap:10px;margin:14px 0 0;font:500 13px var(--sans);color:var(--fg);cursor:pointer}
+.tog input{width:auto;accent-color:var(--accent)}
+#histQ{margin-bottom:12px}
 .toast{position:fixed;bottom:26px;left:50%;transform:translate(-50%,90px);
   background:var(--card);border:1px solid var(--line2);padding:11px 20px;border-radius:8px;
   font-size:13px;transition:.22s cubic-bezier(.2,.8,.2,1);z-index:9}
@@ -140,6 +143,7 @@ input:focus,select:focus{border-color:var(--accent)}
 
   <section>
     <h2>Recent activity <button class="mini" onclick="clearHistory()">clear</button></h2>
+    <input id="histQ" placeholder="Filter history" spellcheck="false" oninput="renderHistory()">
     <div id="log"></div>
   </section>
 
@@ -183,6 +187,10 @@ input:focus,select:focus{border-color:var(--accent)}
       <label>Thinking</label>
       <select id="thinking"></select>
     </div>
+    <label class="tog"><input type="checkbox" id="listenInd"> Listening dot</label>
+    <p class="hint">Pulsing marker, bottom-right, while a session is up.</p>
+    <label class="tog"><input type="checkbox" id="asyncTools"> Async tools</label>
+    <p class="hint">Off restores the old inline tool wait.</p>
     <label>Tour: local dev server URL (optional)</label>
     <input id="devUrl" placeholder="http://localhost:3000" spellcheck="false">
     <label>Tour: what it says over it (optional)</label>
@@ -258,6 +266,10 @@ async function load(){
   fillModels();
   if(document.activeElement!==el('devUrl')) el('devUrl').value=S.settings.dev_url||'';
   if(document.activeElement!==el('devLine')) el('devLine').value=S.settings.dev_line||'';
+  if(document.activeElement!==el('listenInd'))
+    el('listenInd').checked=onish(S.settings.listen_indicator);
+  if(document.activeElement!==el('asyncTools'))
+    el('asyncTools').checked=onish(S.settings.async_tools);
 
   el('sess').innerHTML=
     `<div class="kv"><dt>State</dt><dd class="${on?'good':'off'}">${on?'active':'idle'}</dd></div>
@@ -287,14 +299,27 @@ async function load(){
     +S.windows.slice(0,8).map(w=>`<div class="kv"><dt>${esc(w.app)}</dt>
       <dd class="off">ws ${esc(w.workspace)}</dd></div>`).join('');
 
-  el('log').innerHTML=S.history.length?S.history.map(h=>`
+  renderHistory();
+}
+function onish(v){
+  if(v===true) return true;
+  return String(v??'true').trim().toLowerCase()!=='false' && String(v).trim()!=='0';
+}
+function renderHistory(){
+  const q=(el('histQ').value||'').trim().toLowerCase();
+  const rows=(S.history||[]).filter(h=>{
+    if(!q) return true;
+    const blob=[h.heard,h.reply,h.model,...(h.actions||[]).map(a=>a.tool)].join(' ').toLowerCase();
+    return blob.includes(q);
+  });
+  el('log').innerHTML=rows.length?rows.map(h=>`
     <div class="turn">
       <div class="q">${esc(h.heard)}</div>
       ${h.reply?`<div class="a">${esc(h.reply)}</div>`:''}
       <div class="foot">${(h.actions||[]).map(a=>`<span class="chip${a.ok===false?' bad':''}">${esc(a.tool)}${a.ms!=null?`<small>${a.ms}ms</small>`:''}</span>`).join('')}
         ${h.model||h.turn_ms!=null?`<span class="meta">${esc(h.model||'')}${h.turn_ms!=null?` · ${(h.turn_ms/1000).toFixed(1)}s`:''}${h.usage?.total!=null?` · ${h.usage.total} tok`:''}</span>`:''}
         <time>${esc((h.ts||'').replace('T',' ').slice(5))}</time></div>
-    </div>`).join(''):'<div class="none">Nothing yet. Press F8 and say hello.</div>';
+    </div>`).join(''):'<div class="none">'+(q?'No matching turns.':'Nothing yet. Press F8 and say hello.')+'</div>';
 }
 async function addTool(){
   const b={name:el('ctName').value.trim(),description:el('ctDesc').value.trim(),
@@ -368,6 +393,8 @@ async function saveSettings(){
   const thinking=wrap.hidden?'':el('thinking').value;
   const r=await api('/api/settings',{model:el('model').value,voice:el('voice').value,
     thinking_level:thinking,
+    listen_indicator:el('listenInd').checked?'true':'false',
+    async_tools:el('asyncTools').checked?'true':'false',
     dev_url:el('devUrl').value.trim(),dev_line:el('devLine').value.trim()});
   if(r.error) return toast(r.error,'err');
   toast('saved','ok'); load();

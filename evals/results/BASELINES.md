@@ -4,6 +4,9 @@ Hand-curated headline numbers, one row per phase. Every later phase must beat
 the row above it (or explain why not) before it merges. Raw result files are
 gitignored; regenerate with the command in each row.
 
+Phase 0–1 rows below are 79×3 full-suite runs. Later gates default to
+`--suite cheap` (16×1). Do not re-run a 79×3 unless a rebaseline is asked for.
+
 Pass rate = cases where every `expect` check held. `forbid` = calls to a tool
 the case forbade (the worst kind of miss: the agent did something unasked).
 `turn ms` = send → turn complete, averaged over all runs.

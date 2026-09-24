@@ -68,6 +68,8 @@ class FakeDesktop:
             custom.__name__ = name
             custom.__doc__ = spec.get("description", name)
             custom.__signature__ = sig
+            custom._beckon_blocking = False
+            custom._beckon_scheduling = "WHEN_IDLE"
             reg[name] = self._wrap(name, custom, sig)
         return reg
 
